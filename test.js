@@ -413,17 +413,17 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   assert.match(client, /function scheduleEnhance\(\)/);
   assert.match(client, /new MutationObserver\(scheduleEnhance\)/);
   assert.match(client, /ctx\.slots\.inject\("plugins\.detail\.section"/);
-  // 添加模型落到「该模型上限的 1/5 + 32K」：上游目录给的是能力上限，不是合理默认值。
+  // 添加模型落到最小档：上下文窗口取上限 1/5，输出取上限 1/4。
   assert.ok(
     client.includes("contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW")
-    && client.includes("Math.min(DEFAULT_MAX_TOKENS, outputCeiling ?? DEFAULT_MAX_TOKENS)"),
-    "添加模型时应落到该模型上限的 1/5 与 32K 默认档",
+    && client.includes("defaultMaxTokensTier(caps[model.id]?.maxTokens) ?? DEFAULT_MAX_TOKENS"),
+    "添加模型时应落到该模型上限的 1/5 与不超过 32K 的最大档",
   );
-  // 档位按上游上限切分：上下文窗口 1/5、1/2、上限；输出不超过 maxOutputTokens。
+  // 档位按上游上限切分：上下文窗口 1/5、1/2、上限；最大输出 1/4、1/2、上限。
   assert.match(client, /function contextWindowTiers\(max\)/);
   assert.match(client, /roundTokenTier\(ceiling \/ 5\), roundTokenTier\(ceiling \/ 2\), ceiling/);
   assert.match(client, /function maxTokensTiers\(max\)/);
-  assert.match(client, /filter\(\(value\) => value < ceiling\)/);
+  assert.match(client, /roundTokenTier\(ceiling \/ 4\), roundTokenTier\(ceiling \/ 2\), ceiling/);
   assert.match(web, /contextWindowMax: cap\?\.contextWindow/);
   assert.match(web, /catalog: await catalogCaps\(\)/);
   assert.match(client, /subject\?\.kind === "bundle" && BUNDLE_NAMES\.has\(subject\.pkg\?\.name\)/);
