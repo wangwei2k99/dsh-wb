@@ -39,7 +39,7 @@ import { probeEndpoint } from "./workbuddy-discovery.js";
 
 export { Config };
 
-export const name = "llm-workbuddy";
+export const name = "dsh-workbuddy";
 export const inject = ["llm"];
 
 const NS = typeof dshSettings.settingsNamespace === "function" ? dshSettings.settingsNamespace("llm-pi-ai") : "llm-pi-ai";
@@ -613,8 +613,10 @@ function genericModel(provider, source, entry) {
     baseUrl: source.baseURL,
     input: Array.isArray(entry.input) && entry.input.length > 0 ? [...entry.input] : [...source.defaultInput ?? ["text"]],
     cost: { ...NO_COST },
-    contextWindow: entry.contextWindow ?? source.defaultContextWindow ?? 262144,
-    maxTokens: entry.maxTokens ?? source.defaultMaxTokens ?? 32768,
+    // 兜底值与设置面板「添加模型」的默认档位保持一致（200K / 32K），
+    // 避免同一条模型在不同入口显示成不同窗口。
+    contextWindow: entry.contextWindow ?? source.defaultContextWindow ?? 200000,
+    maxTokens: entry.maxTokens ?? source.defaultMaxTokens ?? 32000,
     ...(reasoning ? { reasoning: true, thinkingLevelMap } : {}),
     ...(entry.compat ?? source.compat ? { compat: { ...(source.compat ?? {}), ...(entry.compat ?? {}) } } : {}),
   };
@@ -679,8 +681,8 @@ function selectWorkBuddyModels(base, entries) {
     return workBuddyModel({
       id: entry.id,
       name: entry.name ?? model?.name ?? entry.id,
-      contextWindow: entry.contextWindow ?? model?.contextWindow ?? 262144,
-      maxTokens: entry.maxTokens ?? model?.maxTokens ?? 32768,
+      contextWindow: entry.contextWindow ?? model?.contextWindow ?? 200000,
+      maxTokens: entry.maxTokens ?? model?.maxTokens ?? 32000,
       images: entry.input?.includes("image") ?? model?.input.includes("image") ?? false,
       ...reasoning,
     });

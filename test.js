@@ -362,7 +362,7 @@ test("新版模型接口只修改 WorkBuddy 条目并保留认证模式", async 
     });
     return response;
   }
-  assert.deepEqual((await call("GET")).body, { ok: true, models: null, revision: 4 });
+  assert.deepEqual((await call("GET")).body, { ok: true, models: null, catalog: {}, revision: 4 });
   assert.deepEqual((await call("POST", { action: "discover" })).body.models, [{ id: "glm-5.3" }]);
   const saved = await call("POST", { action: "save", revision: 4, models: [{ id: "glm-5.3" }] });
   assert.equal(saved.status, 200);
@@ -413,6 +413,19 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   assert.match(client, /function scheduleEnhance\(\)/);
   assert.match(client, /new MutationObserver\(scheduleEnhance\)/);
   assert.match(client, /ctx\.slots\.inject\("plugins\.detail\.section"/);
+  // 添加模型落到「该模型上限的 1/5 + 32K」：上游目录给的是能力上限，不是合理默认值。
+  assert.ok(
+    client.includes("contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW")
+    && client.includes("Math.min(DEFAULT_MAX_TOKENS, outputCeiling ?? DEFAULT_MAX_TOKENS)"),
+    "添加模型时应落到该模型上限的 1/5 与 32K 默认档",
+  );
+  // 档位按上游上限切分：上下文窗口 1/5、1/2、上限；输出不超过 maxOutputTokens。
+  assert.match(client, /function contextWindowTiers\(max\)/);
+  assert.match(client, /roundTokenTier\(ceiling \/ 5\), roundTokenTier\(ceiling \/ 2\), ceiling/);
+  assert.match(client, /function maxTokensTiers\(max\)/);
+  assert.match(client, /filter\(\(value\) => value < ceiling\)/);
+  assert.match(web, /contextWindowMax: cap\?\.contextWindow/);
+  assert.match(web, /catalog: await catalogCaps\(\)/);
   assert.match(client, /subject\?\.kind === "bundle" && BUNDLE_NAMES\.has\(subject\.pkg\?\.name\)/);
   assert.match(index, /const legacyAdapter = typeof adapter\.prepareCall !== "function"/);
   assert.match(index, /adapter\.prepareCall = async \(provider, model, signal\)/);

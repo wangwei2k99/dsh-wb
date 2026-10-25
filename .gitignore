@@ -9,3 +9,4 @@ Thumbs.db
 # 忽略 npm/yarn 的锁文件，避免两套锁文件出现不一致。
 package-lock.json
 yarn.lock
+.commit-msg.txt

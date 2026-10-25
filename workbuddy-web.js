@@ -340,6 +340,36 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
   ctx.inject(["webServer", "settings", "credentials"], (webCtx) => {
     const settings = settingsAccess(webCtx.settings, settingsNs);
     let loginPromise;
+    /**
+     * 上游目录给出的容量上限（`maxInputTokens` / `maxOutputTokens`）。
+     * 页面按它给「上下文窗口」和「最大输出」分档，避免写出上游不支持的组合。
+     * 结果缓存一小段时间：翻设置页不该每次都打一次配置接口。
+     */
+    const CATALOG_TTL_MS = 5 * 60_000;
+    let catalog = { at: 0, caps: {} };
+    const catalogCaps = async () => {
+      if (catalog.at !== 0 && Date.now() - catalog.at < CATALOG_TTL_MS) return catalog.caps;
+      try {
+        const discovered = await webCtx.llm.discoverModels(settingsNs, { provider: PROVIDER });
+        const caps = {};
+        for (const model of Array.isArray(discovered) ? discovered : []) {
+          if (typeof model?.id !== "string" || model.id === "") continue;
+          const contextWindow = Number(model.contextWindow);
+          const maxTokens = Number(model.maxTokens);
+          const entry = {
+            ...(Number.isSafeInteger(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+            ...(Number.isSafeInteger(maxTokens) && maxTokens > 0 ? { maxTokens } : {}),
+          };
+          // 两个字段都没有的模型不占位，前端自然退回内置档位。
+          if (Object.keys(entry).length > 0) caps[model.id] = entry;
+        }
+        catalog = { at: Date.now(), caps };
+        return caps;
+      } catch {
+        // 没有凭据或上游不可达时保持上一次结果（可能为空），页面自动退回内置档位。
+        return catalog.caps;
+      }
+    };
     const currentState = async (requestedSessionId) => {
       const sessionId = sessionIdOf(requestedSessionId);
       const store = await readSessionStore(webCtx.credentials);
@@ -404,6 +434,8 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         if (req.method === "GET") return json(res, 200, {
           ok: true,
           models: profile?.models ?? null,
+          // 每个模型的容量上限，页面据此生成「1/5、1/2、上限」三档。
+          catalog: await catalogCaps(),
           revision: settings.revision(),
         });
         if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
@@ -723,10 +755,15 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
           const modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
           const entry = models.find((model) => model?.id === modelId);
           const fallback = DEFAULT_CONTEXT_WINDOWS[modelId];
+          const caps = await catalogCaps();
+          const cap = modelId === null ? undefined : caps[modelId];
           return json(res, 200, {
             ok: true,
             model: modelId,
-            contextWindow: entry?.contextWindow ?? fallback ?? null,
+            contextWindow: entry?.contextWindow ?? fallback ?? cap?.contextWindow ?? null,
+            // 输入框那个选择器也要按上游上限分档，不能再写死 200K / 500K / 1M。
+            contextWindowMax: cap?.contextWindow ?? null,
+            maxTokensMax: cap?.maxTokens ?? null,
             revision: settings.revision(),
           });
         }
@@ -739,8 +776,11 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         if (!Number.isSafeInteger(body.contextWindow) || body.contextWindow <= 0) {
           return json(res, 400, { ok: false, message: "上下文窗口必须是正整数" });
         }
-        if (body.contextWindow > MAX_CONTEXT_WINDOW) {
-          return json(res, 400, { ok: false, message: `上下文窗口不能超过 ${MAX_CONTEXT_WINDOW}` });
+        // 上限优先取上游对该模型声明的 maxInputTokens，取不到才用兜底常量。
+        const modelCaps = await catalogCaps();
+        const ceiling = modelCaps[String(body.model).trim()]?.contextWindow ?? MAX_CONTEXT_WINDOW;
+        if (body.contextWindow > ceiling) {
+          return json(res, 400, { ok: false, message: `上下文窗口不能超过该模型上限 ${ceiling}` });
         }
         const modelId = body.model.trim();
         const existing = models.findIndex((model) => model?.id === modelId);

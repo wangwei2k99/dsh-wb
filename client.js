@@ -55,6 +55,67 @@ window.__ModuleLoader__.load({
       { value: 128000, label: "128K", hint: "极少数超长输出场景" },
     ];
     const DEFAULT_MAX_TOKENS = 32000;
+
+    /**
+     * 档位取整：1/5、1/2 切出来的值可能是 102400 这种数字，取整到千位再展示。
+     * 误差 < 1%，仍在 5% 的归位容差内，不会让已存的值丢掉档位。
+     */
+    function roundTokenTier(value) {
+      if (!Number.isFinite(value) || value <= 0) return value;
+      return value >= 10000 ? Math.round(value / 1000) * 1000 : Math.round(value);
+    }
+
+    /** 档位标签：1000000 写成 1M，其余按 K 显示（不足整千的保留一位小数）。 */
+    function formatTokenTier(value) {
+      if (!Number.isFinite(value) || value <= 0) return "—";
+      if (value >= 1000000 && value % 100000 === 0) return `${value / 1000000}M`;
+      if (value % 1000 === 0) return `${value / 1000}K`;
+      if (value >= 1000) return `${(value / 1000).toFixed(1).replace(/\.0$/, "")}K`;
+      return String(value);
+    }
+
+    /**
+     * 上下文窗口档位：按该模型的上游上限（maxInputTokens）切三档——1/5、1/2、上限。
+     * 上限来自「获取模型」拿到的目录，拿不到时退回内置档位，保证老配置照样能编辑。
+     */
+    function contextWindowTiers(max) {
+      const ceiling = roundTokenTier(max);
+      if (!Number.isFinite(ceiling) || ceiling <= 0) return CONTEXT_WINDOW_OPTIONS;
+      const values = [...new Set([roundTokenTier(ceiling / 5), roundTokenTier(ceiling / 2), ceiling])]
+        .filter((value) => value > 0)
+        .sort((left, right) => left - right);
+      return values.map((value, index) => ({
+        value,
+        label: formatTokenTier(value),
+        hint: index === values.length - 1
+          ? `上游上限（${formatTokenTier(ceiling)}）；每轮积分消耗最高`
+          : index === 0
+            ? "最小档，按上限 1/5 取；最省积分"
+            : "中间档，按上限 1/2 取；长文档、跨文件分析",
+      }));
+    }
+
+    /**
+     * 最大输出档位：按该模型的上游上限（maxOutputTokens）切三档——1/4、1/2、上限。
+     * 上限来自「获取模型」拿到的目录；拿不到时退回内置档位。
+     * 超过上限的值不展示——上游不会报错，只会静默截断。
+     */
+    function maxTokensTiers(max) {
+      const ceiling = roundTokenTier(max);
+      if (!Number.isFinite(ceiling) || ceiling <= 0) return MAX_TOKENS_OPTIONS;
+      const values = [...new Set([roundTokenTier(ceiling / 4), roundTokenTier(ceiling / 2), ceiling])]
+        .filter((value) => value > 0)
+        .sort((left, right) => left - right);
+      return values.map((value, index) => ({
+        value,
+        label: formatTokenTier(value),
+        hint: index === values.length - 1
+          ? `上游上限（${formatTokenTier(ceiling)}）；输出与输入共享上下文窗口`
+          : index === 0
+            ? "最小档，按上限 1/4 取；响应最快、最省积分"
+            : "中间档，按上限 1/2 取；长文件生成、多文件重构",
+      }));
+    }
     /** 最大输出 Token 下拉的最小宽度，表头与字段共用。 */
     const MAX_TOKENS_SELECT_WIDTH = "110px";
     /** 模型列表“操作”列宽度（删除按钮所在列），表头与数据行共用。 */
@@ -1587,6 +1648,8 @@ window.__ModuleLoader__.load({
       host.append(actions, list, candidates, message);
       let models = null;
       let revision;
+      // 每个模型的上游容量上限（maxInputTokens / maxOutputTokens），来自 /models 的 catalog。
+      let caps = {};
       let busy = false;
       const invalidReasoning = new Set();
       const say = (value, error = false) => {
@@ -1654,26 +1717,42 @@ window.__ModuleLoader__.load({
         });
         return select;
       };
-      /** 上下文窗口下拉：默认 200K，可选 500K / 1M。 */
-      const makeContextWindowSelect = (model) => makeOptionSelect({
-        model,
-        key: "contextWindow",
-        label: "上下文窗口",
-        hint: "上下文窗口；窗口越大，每轮消耗的积分越多",
-        options: CONTEXT_WINDOW_OPTIONS,
-        fallback: DEFAULT_CONTEXT_WINDOW,
-        ariaLabel: "上下文窗口",
-      });
-      /** 最大输出 Token 下拉：默认 32K，可选 64K / 128K。 */
-      const makeMaxTokensSelect = (model) => makeOptionSelect({
-        model,
-        key: "maxTokens",
-        label: "最大输出 Token",
-        hint: "单次响应的输出上限；输出与输入共享上下文预算",
-        options: MAX_TOKENS_OPTIONS,
-        fallback: DEFAULT_MAX_TOKENS,
-        ariaLabel: "最大输出 Token",
-      });
+      /** 上下文窗口下拉：按该模型上游上限切 1/5、1/2、上限三档。 */
+      const makeContextWindowSelect = (model) => {
+        const ceiling = caps[model.id]?.contextWindow;
+        // 存量配置可能比上限还大（例如改过模型目录），这里直接收敛，保存时一并落盘。
+        if (Number.isFinite(ceiling) && Number.isFinite(model.contextWindow) && model.contextWindow > ceiling) {
+          model.contextWindow = ceiling;
+        }
+        const options = contextWindowTiers(ceiling);
+        return makeOptionSelect({
+          model,
+          key: "contextWindow",
+          label: "上下文窗口",
+          hint: "上下文窗口；窗口越大，每轮消耗的积分越多",
+          options,
+          // 没有存量值时落到最小档（1/5），与「添加模型」的默认保持一致。
+          fallback: options[0]?.value ?? DEFAULT_CONTEXT_WINDOW,
+          ariaLabel: "上下文窗口",
+        });
+      };
+      /** 最大输出 Token 下拉：只列不超过该模型 maxOutputTokens 的档位。 */
+      const makeMaxTokensSelect = (model) => {
+        const ceiling = caps[model.id]?.maxTokens;
+        if (Number.isFinite(ceiling) && Number.isFinite(model.maxTokens) && model.maxTokens > ceiling) {
+          model.maxTokens = ceiling;
+        }
+        const options = maxTokensTiers(ceiling);
+        return makeOptionSelect({
+          model,
+          key: "maxTokens",
+          label: "最大输出 Token",
+          hint: "单次响应的输出上限；输出与输入共享上下文预算",
+          options,
+          fallback: Math.min(options[0]?.value ?? DEFAULT_MAX_TOKENS, ceiling ?? DEFAULT_MAX_TOKENS),
+          ariaLabel: "最大输出 Token",
+        });
+      };
       /**
        * 表头与数据行共用同一套网格列定义，保证逐列对齐。
        * 前两列等分剩余空间，其余为固定宽度。
@@ -1814,6 +1893,7 @@ window.__ModuleLoader__.load({
         .then((state) => {
           if (!state.ok) throw new Error(state.message);
           models = state.models?.map((model) => ({ ...model })) ?? null;
+          caps = state.catalog && typeof state.catalog === "object" ? state.catalog : {};
           revision = state.revision;
           render();
         })
@@ -1893,17 +1973,17 @@ window.__ModuleLoader__.load({
           const addSelected = primaryButton("添加选中模型");
           addSelected.addEventListener("click", () => {
             models ??= [];
-            // 在线目录可能不返回 contextWindow/maxTokens，或返回不合理的值；
-            // 添加时补齐默认档位（200K / 32K），避免留空导致回退到上游猜测值。
-            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => ({
-              ...model,
-              contextWindow: Number.isFinite(model.contextWindow) && model.contextWindow > 0
-                ? model.contextWindow
-                : DEFAULT_CONTEXT_WINDOW,
-              maxTokens: Number.isFinite(model.maxTokens) && model.maxTokens > 0
-                ? model.maxTokens
-                : DEFAULT_MAX_TOKENS,
-            })));
+            // 新模型落到最小档：上下文窗口取该模型上限的 1/5，输出取 32K（不超过上游上限）。
+            // 上游目录给的是「能力上限」，不是合理默认值——窗口越大，每轮随行历史越多，积分越高。
+            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => {
+              const contextWindow = contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW;
+              const outputCeiling = caps[model.id]?.maxTokens;
+              return {
+                ...model,
+                contextWindow,
+                maxTokens: Math.min(DEFAULT_MAX_TOKENS, outputCeiling ?? DEFAULT_MAX_TOKENS),
+              };
+            }));
             candidates.replaceChildren();
             render();
           });
@@ -2048,7 +2128,7 @@ window.__ModuleLoader__.load({
       return String(value);
     }
 
-    const snapContextWindow = (value) => snapToOptions(CONTEXT_WINDOW_OPTIONS, value);
+    const snapContextWindow = (value, options = CONTEXT_WINDOW_OPTIONS) => snapToOptions(options, value);
     const exactContextWindow = exactOptionLabel;
 
     /**
@@ -2066,6 +2146,8 @@ window.__ModuleLoader__.load({
       const selected = isWorkBuddyProvider(provider);
       const modelId = selection?.next?.model ?? selection?.lastUsed?.model ?? selection?.model;
       const [value, setValue] = useState(null);
+      // 该模型的上游上下文上限（maxInputTokens），用于生成 1/5、1/2、上限三档。
+      const [ceiling, setCeiling] = useState(null);
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState(null);
       // 菜单开合状态必须与上面几个 hook 一起声明在 early return 之前：
@@ -2078,13 +2160,18 @@ window.__ModuleLoader__.load({
         let disposed = false;
         if (!selected || !modelId) {
           setValue(null);
+          setCeiling(null);
           return () => { disposed = true; };
         }
         authRequest("context-window", undefined, undefined, { model: modelId })
           .then((result) => {
-            if (!disposed) setValue(typeof result?.contextWindow === "number" ? result.contextWindow : DEFAULT_CONTEXT_WINDOW);
+            if (disposed) return;
+            setValue(typeof result?.contextWindow === "number" ? result.contextWindow : DEFAULT_CONTEXT_WINDOW);
+            setCeiling(typeof result?.contextWindowMax === "number" && result.contextWindowMax > 0 ? result.contextWindowMax : null);
           })          .catch(() => {
-            if (!disposed) setValue(DEFAULT_CONTEXT_WINDOW);
+            if (disposed) return;
+            setValue(DEFAULT_CONTEXT_WINDOW);
+            setCeiling(null);
           });
         return () => { disposed = true; };
       }, [selected, modelId]);
@@ -2125,11 +2212,12 @@ window.__ModuleLoader__.load({
         }
       };
 
-      const snapped = snapContextWindow(value);
+      const tiers = contextWindowTiers(ceiling);
+      const snapped = snapContextWindow(value, tiers);
       const displayValue = snapped ?? value;
       const options = snapped !== null
-        ? CONTEXT_WINDOW_OPTIONS
-        : [...CONTEXT_WINDOW_OPTIONS, { value, label: exactContextWindow(value), hint: "当前自定义值" }];
+        ? tiers
+        : [...tiers, { value, label: exactContextWindow(value), hint: "当前自定义值" }];
       const current = options.find((option) => option.value === displayValue) ?? options[0];
 
       // 结构照抄 DSH 官方 PermissionSelect：trigger 按钮 + 向上弹出的 Menu。
