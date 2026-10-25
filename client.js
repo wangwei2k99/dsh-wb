@@ -1746,7 +1746,17 @@ window.__ModuleLoader__.load({
           const addSelected = primaryButton("添加选中模型");
           addSelected.addEventListener("click", () => {
             models ??= [];
-            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => ({ ...model })));
+            // 在线目录可能不返回 contextWindow/maxTokens，或返回不合理的值；
+            // 添加时补齐默认档位（200K / 32K），避免留空导致回退到上游猜测值。
+            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => ({
+              ...model,
+              contextWindow: Number.isFinite(model.contextWindow) && model.contextWindow > 0
+                ? model.contextWindow
+                : DEFAULT_CONTEXT_WINDOW,
+              maxTokens: Number.isFinite(model.maxTokens) && model.maxTokens > 0
+                ? model.maxTokens
+                : DEFAULT_MAX_TOKENS,
+            })));
             candidates.replaceChildren();
             render();
           });
