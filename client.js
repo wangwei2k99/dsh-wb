@@ -96,6 +96,16 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 新模型的输出默认值：取不超过 32K 的最大档，让「默认 32K」的既有约定继续成立
+     * （上限 32K 的模型落在 32K，上限 8K 的模型落在 8K），不出范围。
+     */
+    function defaultMaxTokensTier(max) {
+      const tiers = maxTokensTiers(max).map((option) => option.value);
+      const within = tiers.filter((value) => value <= DEFAULT_MAX_TOKENS);
+      return within.at(-1) ?? tiers[0];
+    }
+
+    /**
      * 最大输出档位：按该模型的上游上限（maxOutputTokens）切三档——1/4、1/2、上限。
      * 上限来自「获取模型」拿到的目录；拿不到时退回内置档位。
      * 超过上限的值不展示——上游不会报错，只会静默截断。
@@ -1736,7 +1746,7 @@ window.__ModuleLoader__.load({
           ariaLabel: "上下文窗口",
         });
       };
-      /** 最大输出 Token 下拉：只列不超过该模型 maxOutputTokens 的档位。 */
+      /** 最大输出 Token 下拉：按该模型上游上限切 1/4、1/2、上限三档。 */
       const makeMaxTokensSelect = (model) => {
         const ceiling = caps[model.id]?.maxTokens;
         if (Number.isFinite(ceiling) && Number.isFinite(model.maxTokens) && model.maxTokens > ceiling) {
@@ -1749,7 +1759,8 @@ window.__ModuleLoader__.load({
           label: "最大输出 Token",
           hint: "单次响应的输出上限；输出与输入共享上下文预算",
           options,
-          fallback: Math.min(options[0]?.value ?? DEFAULT_MAX_TOKENS, ceiling ?? DEFAULT_MAX_TOKENS),
+          // 没有存量值时取「不超过 32K 的最大档」，与「添加模型」的默认保持一致。
+          fallback: defaultMaxTokensTier(ceiling) ?? DEFAULT_MAX_TOKENS,
           ariaLabel: "最大输出 Token",
         });
       };
@@ -1973,17 +1984,13 @@ window.__ModuleLoader__.load({
           const addSelected = primaryButton("添加选中模型");
           addSelected.addEventListener("click", () => {
             models ??= [];
-            // 新模型落到最小档：上下文窗口取该模型上限的 1/5，输出取 32K（不超过上游上限）。
+            // 新模型落到最小档：上下文窗口取该模型上限的 1/5，输出取不超过 32K 的最大档。
             // 上游目录给的是「能力上限」，不是合理默认值——窗口越大，每轮随行历史越多，积分越高。
-            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => {
-              const contextWindow = contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW;
-              const outputCeiling = caps[model.id]?.maxTokens;
-              return {
-                ...model,
-                contextWindow,
-                maxTokens: Math.min(DEFAULT_MAX_TOKENS, outputCeiling ?? DEFAULT_MAX_TOKENS),
-              };
-            }));
+            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => ({
+              ...model,
+              contextWindow: contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW,
+              maxTokens: defaultMaxTokensTier(caps[model.id]?.maxTokens) ?? DEFAULT_MAX_TOKENS,
+            })));
             candidates.replaceChildren();
             render();
           });
