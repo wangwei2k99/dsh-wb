@@ -262,7 +262,7 @@ test("新旧 DSH 配置都注册 WorkBuddy，next 使用插件条目命名空间
   const listeners = new Map();
   const injected = [];
   const ctx = {
-    fiber: { entry: { options: { id: "llm-workbuddy" } } },
+    fiber: { entry: { options: { id: "dsh-workbuddy" } } },
     inject(names, callback) { injected.push({ names, callback }); },
     on(event, callback) { listeners.set(event, callback); },
     llm: {
@@ -284,8 +284,8 @@ test("新旧 DSH 配置都注册 WorkBuddy，next 使用插件条目命名空间
   apply(ctx, reactive);
   assert.deepEqual(registered[0], ["workbuddy-cn"]);
   assert.deepEqual(directories[0].map((entry) => entry.provider), ["workbuddy-cn"]);
-  assert.equal(directories[0][0].settingsNs, "llm-workbuddy");
-  assert.deepEqual(discoveries, ["llm-workbuddy"]);
+  assert.equal(directories[0][0].settingsNs, "dsh-workbuddy");
+  assert.deepEqual(discoveries, ["dsh-workbuddy"]);
   assert.ok(listeners.has("loader/volatile-update"));
   assert.ok(injected.some(({ names }) => names.includes("settings")));
 

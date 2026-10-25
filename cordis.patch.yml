@@ -6,5 +6,5 @@
     .match(/^0\.1\.(\d+)/)?.[1] ?? 7) < 7
 
 - insert:
-    - id: llm-workbuddy
+    - id: dsh-workbuddy
       name: '@wangwei2k99/dsh-workbuddy'
