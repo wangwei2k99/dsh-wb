@@ -76,21 +76,26 @@ harness credential store 的 `llm-pi-ai/<provider id>` 记录，由宿主负责�
 在 **设置 → 插件 → 添加插件** 中安装：
 
 ```text
-@wangwei2k99/dsh-workbuddy
+github:wangwei2k99/dsh-workbuddy
 ```
 
 也可以在终端执行，更新时使用同一条命令：
 
 ```powershell
-dsh plugin --profile desktop add @wangwei2k99/dsh-workbuddy@latest
+dsh plugin --profile desktop add github:wangwei2k99/dsh-workbuddy
 ```
+
+> **为什么不是 `@wangwei2k99/dsh-workbuddy@latest`**：这个包目前**没有发布到
+> npm registry**（查询返回 404），`@latest` / `npx` 形式会直接失败。桌面 Profile
+> 里记录的也是 `github:` 源，上面两条命令与实际生效的安装方式一致。
+> 等包正式发布到 npm 之后，把 `github:…` 换成 `@wangwei2k99/dsh-workbuddy@latest` 即可。
 
 ### Web / Headless / 桌面
 
-一键安装或更新**所有已存在的 Profile**：
+一键安装或更新**所有已存在的 Profile**（先克隆本仓库，再在仓库根目录执行）：
 
 ```powershell
-npx --yes @wangwei2k99/dsh-workbuddy@latest install
+node cli.js install
 ```
 
 > 以前这条命令只处理 `web` 和 `headless`，桌面版用的 `desktop` Profile 会被漏掉——
@@ -100,7 +105,7 @@ npx --yes @wangwei2k99/dsh-workbuddy@latest install
 仅安装 Web Profile：
 
 ```powershell
-dsh plugin --profile web add @wangwei2k99/dsh-workbuddy@latest
+dsh plugin --profile web add github:wangwei2k99/dsh-workbuddy
 ```
 
 **安装或更新后，完整退出并重新启动 DSH。** 只刷新页面不会完成更新。
@@ -112,10 +117,10 @@ dsh plugin --profile web add @wangwei2k99/dsh-workbuddy@latest
 >
 > ```powershell
 > dsh plugin --profile desktop remove @axiaohungry/dsh-llm-workbuddy
-> dsh plugin --profile desktop add @wangwei2k99/dsh-workbuddy@latest
+> dsh plugin --profile desktop add github:wangwei2k99/dsh-workbuddy
 > ```
 >
-> `npx … install` 会自动清理旧包名和旧行 id。
+> `node cli.js install` 会自动清理旧包名和旧行 id。
 
 ### 与旧插件共存时以本插件为准
 
@@ -284,10 +289,10 @@ modlens doctor --json
 dsh plugin --profile desktop remove @wangwei2k99/dsh-workbuddy
 ```
 
-Web / Headless 安装器：
+Web / Headless 安装器（在仓库根目录执行）：
 
 ```powershell
-npx --yes @wangwei2k99/dsh-workbuddy@latest uninstall
+node cli.js uninstall
 ```
 
 卸载后重启 DSH。安装器默认保留凭据，便于后续重新安装。
