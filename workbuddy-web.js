@@ -34,18 +34,12 @@ const PROVIDER = "workbuddy-cn";
 const LEGACY_PROVIDER = "codebuddy-cn";
 const API_KEY_ENV = "WORKBUDDY_API_KEY";
 const LEGACY_API_KEY_ENV = "CODEBUDDY_API_KEY";
-const ROUTE = "/dsh-llm-workbuddy/auth";
+const ROUTE = "/dsh-workbuddy/auth";
 const ENV_SOURCES = new Set(["env", "user-env", "project-env"]);
 
 /** 上下文窗口上限：超过此值的写入请求会被拒绝。 */
 const MAX_CONTEXT_WINDOW = 1000000;
 
-/** 各模型的默认上下文窗口，仅在没有显式配置时使用。 */
-const DEFAULT_CONTEXT_WINDOWS = Object.freeze({
-  "deepseek-v4.1-flash": 1000000,
-  "kimi-k3.1-pro": 1000000,
-  "kimi-k3.1-pro-highspeed": 1000000,
-});
 
 export function authenticationMode(config) {
   const profile = config?.providers?.[PROVIDER] ?? config?.providers?.[LEGACY_PROVIDER];
@@ -754,14 +748,13 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         if (req.method === "GET") {
           const modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
           const entry = models.find((model) => model?.id === modelId);
-          const fallback = DEFAULT_CONTEXT_WINDOWS[modelId];
           const caps = await catalogCaps();
           const cap = modelId === null ? undefined : caps[modelId];
           return json(res, 200, {
             ok: true,
             model: modelId,
-            contextWindow: entry?.contextWindow ?? fallback ?? cap?.contextWindow ?? null,
-            // 输入框那个选择器也要按上游上限分档，不能再写死 200K / 500K / 1M。
+            contextWindow: entry?.contextWindow ?? cap?.contextWindow ?? null,
+            maxTokens: entry?.maxTokens ?? cap?.maxTokens ?? null,
             contextWindowMax: cap?.contextWindow ?? null,
             maxTokensMax: cap?.maxTokens ?? null,
             revision: settings.revision(),
@@ -776,17 +769,31 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         if (!Number.isSafeInteger(body.contextWindow) || body.contextWindow <= 0) {
           return json(res, 400, { ok: false, message: "上下文窗口必须是正整数" });
         }
-        // 上限优先取上游对该模型声明的 maxInputTokens，取不到才用兜底常量。
+        if (body.maxTokens !== undefined && (!Number.isSafeInteger(body.maxTokens) || body.maxTokens <= 0)) {
+          return json(res, 400, { ok: false, message: "最大输出必须是正整数" });
+        }
+        if (Number.isSafeInteger(body.maxTokens) && body.maxTokens > body.contextWindow) {
+          return json(res, 400, { ok: false, message: "最大输出不能超过上下文窗口" });
+        }
+        // 上限优先取上游对该模型声明的 maxInputTokens / maxOutputTokens，取不到才用兜底常量。
         const modelCaps = await catalogCaps();
-        const ceiling = modelCaps[String(body.model).trim()]?.contextWindow ?? MAX_CONTEXT_WINDOW;
+        const cap = modelCaps[String(body.model).trim()];
+        const ceiling = cap?.contextWindow ?? MAX_CONTEXT_WINDOW;
         if (body.contextWindow > ceiling) {
           return json(res, 400, { ok: false, message: `上下文窗口不能超过该模型上限 ${ceiling}` });
         }
+        if (Number.isSafeInteger(body.maxTokens) && Number.isSafeInteger(cap?.maxTokens) && body.maxTokens > cap.maxTokens) {
+          return json(res, 400, { ok: false, message: `最大输出不能超过该模型上限 ${cap.maxTokens}` });
+        }
         const modelId = body.model.trim();
+        const patch = {
+          contextWindow: body.contextWindow,
+          ...(Number.isSafeInteger(body.maxTokens) ? { maxTokens: body.maxTokens } : {}),
+        };
         const existing = models.findIndex((model) => model?.id === modelId);
         const nextModels = existing >= 0
-          ? models.map((model, index) => index === existing ? { ...model, contextWindow: body.contextWindow } : model)
-          : [...models, { id: modelId, contextWindow: body.contextWindow }];
+          ? models.map((model, index) => index === existing ? { ...model, ...patch } : model)
+          : [...models, { id: modelId, ...patch }];
         const path = ["providers", providers[PROVIDER] === undefined && providers[LEGACY_PROVIDER] !== undefined ? LEGACY_PROVIDER : PROVIDER];
         const ops = profile === undefined
           ? [{ op: "set", path, value: { apiKeyEnv: API_KEY_ENV, models: nextModels } }]
@@ -796,6 +803,7 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
           ok: true,
           model: modelId,
           contextWindow: body.contextWindow,
+          ...(Number.isSafeInteger(body.maxTokens) ? { maxTokens: body.maxTokens } : {}),
           models: nextModels,
           revision: settings.revision(),
         });
@@ -804,21 +812,35 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
       }
     };
     webCtx.effect(() => {
+      /**
+       * 注册一条路由。被占用的路径不算失败：进程里可能还留着一个用旧路由的
+       * 历史包实例，它的 fiber 尚未卸载完时同路径注册会直接抛错——那不该把
+       * 整个插件启动拖垮，其余路由照常可用。
+       */
+      const take = (path, handler) => {
+        try {
+          return webCtx.webServer.register({ kind: "exact", path, handler });
+        } catch {
+          return undefined;
+        }
+      };
       const dispose = [
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/status`, handler: status }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/models`, handler: models }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/context-window`, handler: contextWindow }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/routing`, handler: routing }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/unbind`, handler: unbind }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/api-key`, handler: apiKey }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/api-key/add`, handler: addApiKey }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/api-key/remove`, handler: removeApiKey }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/token`, handler: token }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/credits`, handler: credits }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/login`, handler: login }),
-        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/remove`, handler: remove }),
+        take(`${ROUTE}/status`, status),
+        take(`${ROUTE}/models`, models),
+        take(`${ROUTE}/context-window`, contextWindow),
+        take(`${ROUTE}/routing`, routing),
+        take(`${ROUTE}/unbind`, unbind),
+        take(`${ROUTE}/api-key`, apiKey),
+        take(`${ROUTE}/api-key/add`, addApiKey),
+        take(`${ROUTE}/api-key/remove`, removeApiKey),
+        take(`${ROUTE}/token`, token),
+        take(`${ROUTE}/credits`, credits),
+        take(`${ROUTE}/login`, login),
+        take(`${ROUTE}/remove`, remove),
       ];
-      return () => dispose.forEach((fn) => fn());
-    }, "llm-workbuddy: web login routes");
+      return () => {
+        for (const fn of dispose) if (typeof fn === "function") fn();
+      };
+    }, "workbuddy: web login routes");
   });
 }

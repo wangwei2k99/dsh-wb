@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -204,8 +204,29 @@ async function login() {
   }
 }
 
+/**
+ * 需要处理的 profile 列表。
+ *
+ * 以前只写死 `web` / `headless`，但桌面版跑的是 `desktop` profile——于是用
+ * `dsh-workbuddy install` 装完之后，日常在用的那个 profile 里旧包依然保留，
+ * 两个插件同进程抢同一个 provider，正好是这次要根除的冲突。
+ *
+ * 改成扫描 `~/.dsh/profiles` 下真实存在的 profile，一个都不漏。目录不存在时
+ * 退回旧的两个名字，保持 `dsh plugin add` 自己创建 profile 的行为。
+ */
+function targetProfiles(home = dshHome()) {
+  const root = join(home, "profiles");
+  if (!existsSync(root)) return ["web", "headless"];
+  const found = readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .filter((name) => existsSync(join(root, name, "package.json")) || existsSync(join(root, name, "pnpm-workspace.yaml")))
+    .sort();
+  return found.length ? found : ["web", "headless"];
+}
+
 function install() {
-  for (const profile of ["web", "headless"]) {
+  for (const profile of targetProfiles()) {
     runDsh(["plugin", "--profile", profile, "list", "--depth", "0"]);
     const workspace = join(dshHome(), "profiles", profile, "pnpm-workspace.yaml");
     withPnpmBuildPolicy(workspace, () => {
@@ -222,7 +243,7 @@ function install() {
 
 function uninstall(home = dshHome()) {
   const backup = cleanSettings(join(home, "settings.yaml"));
-  for (const profile of ["web", "headless"]) {
+  for (const profile of targetProfiles(home)) {
     const workspace = join(home, "profiles", profile, "pnpm-workspace.yaml");
     const installedPackages = [PACKAGE, ...LEGACY_PACKAGES].filter((packageName) => profileHasPackage(home, profile, packageName));
     if (installedPackages.length) {
@@ -295,6 +316,21 @@ function selfTest() {
     if (!dshEnv()[pathKey].split(delimiter)[0].endsWith(join("node_modules", ".bin"))) {
       throw new Error("bundled pnpm PATH self-test failed");
     }
+    // profile 扫描：不能再漏掉 desktop，也不能把没有 package.json 的目录当成 profile。
+    const profileHome = join(root, "home");
+    if (targetProfiles(profileHome).join(",") !== "web,headless") {
+      throw new Error("profile scan fallback self-test failed");
+    }
+    for (const name of ["desktop", "web"]) {
+      mkdirSync(join(profileHome, "profiles", name), { recursive: true });
+      writeFileSync(join(profileHome, "profiles", name, "package.json"), "{}\n", "utf8");
+    }
+    mkdirSync(join(profileHome, "profiles", "empty-dir"), { recursive: true });
+    mkdirSync(join(profileHome, "profiles", "headless"), { recursive: true });
+    writeFileSync(join(profileHome, "profiles", "headless", "pnpm-workspace.yaml"), "packages:\n  - .\n", "utf8");
+    if (targetProfiles(profileHome).join(",") !== "desktop,headless,web") {
+      throw new Error(`profile scan self-test failed: ${targetProfiles(profileHome).join(",")}`);
+    }
     console.log("CLI-SELF-TEST-OK");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -307,6 +343,6 @@ else if (command === "uninstall") uninstall();
 else if (command === "login") await login();
 else if (command === "--self-test") selfTest();
 else {
-  console.log("用法：dsh-llm-workbuddy <install|login|uninstall>");
+  console.log("用法：dsh-workbuddy <install|login|uninstall>");
   process.exitCode = 1;
 }

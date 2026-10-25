@@ -1,3 +1,9 @@
+# 本文件是本插件的 bundle patch：DSH 把它叠加在 profile 的其它层之后。
+#
+# 与旧插件并存的处理放在 index.js 的 apply() 里（运行时让位），不写在这里：
+# 不带 insert 的 patch 若指向不存在的 id，Loader 每次启动都会打一行 warn，
+# 而旧插件通常并不在场，绝大多数用户会白白看到 4 条 "entry not found"。
+
 - id: llm-pi-ai
   disabled: !!js >-
     !ctx.get('profileContext')?.installAnchor ||

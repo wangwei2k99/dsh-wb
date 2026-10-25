@@ -20,7 +20,7 @@
     "./locale/*": "./locale/*"
   },
   "bin": {
-    "dsh-llm-workbuddy": "cli.js"
+    "dsh-workbuddy": "cli.js"
   },
   "repository": {
     "type": "git",

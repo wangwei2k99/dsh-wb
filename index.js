@@ -353,7 +353,7 @@ function errorFields(error) {
 
 function traceEvent(trace, stage, details = {}) {
   if (!trace) return;
-  console.info("[dsh-llm-workbuddy]", JSON.stringify({ request: trace.id, stage, ...details }));
+  console.info("[dsh-workbuddy]", JSON.stringify({ request: trace.id, stage, ...details }));
 }
 
 /**
@@ -847,12 +847,330 @@ function installSettingsCompat(ctx, ns, schema, entry, hooks) {
   });
 }
 
-export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, providerSettings, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor, estimateTextTokens, estimateContextTokens, boundContextBudget, silentContextOverflow, workBuddyApi });
+/* ─────────────────────── 与历史插件共存时的选举 ───────────────────────
+ *
+ * 同一个 DSH 进程里可能同时存在本插件与历史包（dsh-llm-workbuddy /
+ * dsh-llm-codebuddy …），也可能存在本包的两条安装行。它们都要注册 provider
+ * "workbuddy-cn"，而 llm 服务的注册是先到先得、后到者抛 DUPLICATE_*，于是
+ * "谁先 apply 谁生效"——这不该由 YAML 里的行序决定。这里加两层机制：
+ *
+ *   1. 选举：在根上下文的全局 symbol 上记录所有者。本包的多个副本之间只有
+ *      第一个真正 apply 的那条生效，其余把自身所在的行停用（只在内存里）后
+ *      静默退出，因此不会再产生重复注册。
+ *   2. 抢占：历史包不认识这套约定，无法协作。于是安装前先停用它们所在的行并
+ *      释放其 fiber；若对手已经抢注成功，则释放对手后重试安装。
+ *
+ * 全部改动只落在内存（entry.options.disabled / 释放 fiber），绝不写回
+ * cordis.yml 或 cordis.patch.yml —— 那两份文件属于用户，写错会直接破坏启动。
+ * 被停用的行在内存中已是 disabled，因此启动诊断（inactiveEntries）与客户端
+ * 包扫描（cm-index）都会跳过它们，不会再出现 "did not activate" 或
+ * "resolves from multiple active Loader sources"。
+ */
+const ELECTION_KEY = Symbol.for("dsh-workbuddy.election");
+const ELECTION_OWNER = "@wangwei2k99/dsh-workbuddy";
+const ELECTION_DEPTH = 32;
+const ELECTION_ENTRY_LIMIT = 4096;
+// 守夜节奏：前段密集（对手可能刚 apply 完，甚至还在 import），后段稀疏，总时长约 12s。
+const ELECTION_TICK_PLAN = [120, 250, 400, 700, 1_200, 2_000, 3_000, 4_000];
+// 对手 fiber 的卸载是异步的：目录条目要等它的 disposer 跑完才释放，所以重试前必须
+// 等"卸载真正完成"，同步重试只会再撞一次。超时兜底，避免被一个卡死的对手拖住。
+const RECLAIM_TIMEOUT_MS = 3_000;
+const RECLAIM_ATTEMPTS = 3;
+// 释放自己的注册句柄同样是异步的（effect 的 disposer 要过几个微任务才删键），
+// 所以重试前再让出一拍，避免把自己的残留当成"对手又抢注了"。
+const RECLAIM_RETRY_MS = 40;
+const OWN_PACKAGES = new Set(["@wangwei2k99/dsh-workbuddy", "dsh-workbuddy"]);
+const RIVAL_PACKAGE_PATTERN = /(?:work|code)-?buddy/i;
+const RIVAL_ID_PATTERN = /(?:work|code)-?buddy/i;
+const RIVAL_CONFLICT_CODES = new Set(["DUPLICATE_DIRECTORY", "DUPLICATE_ADAPTER", "DUPLICATE_DISCOVERY"]);
+
+/** 从条目 name 里取出包名：去掉 npm: 前缀与 @version 后缀，本地路径行返回 undefined。 */
+function packageOf(value) {
+  if (typeof value !== "string") return undefined;
+  let spec = value.trim();
+  if (!spec) return undefined;
+  if (spec.startsWith("npm:")) spec = spec.slice(4);
+  if (/^(?:\.{0,2}[\\/]|[a-zA-Z]:[\\/]|file:|node:|https?:)/.test(spec)) return undefined;
+  const at = spec.lastIndexOf("@");
+  if (at > 0) spec = spec.slice(0, at);
+  return spec || undefined;
+}
+
+/** 复刻 loader 的条目 id（嵌套条目带父级前缀），失败时退回原始 id。 */
+function entryIdOf(entry) {
+  try {
+    const id = entry?.id;
+    if (typeof id === "string") return id;
+  } catch {}
+  const raw = entry?.options?.id;
+  return typeof raw === "string" ? raw : undefined;
+}
+
+/** 只把"还在跑"的 fiber 当作竞争者：已 disposed（4）与已卸载（5）都不算。 */
+function isLiveFiber(fiber) {
+  if (!fiber || typeof fiber !== "object") return false;
+  if (fiber.uid === null || fiber.uid === undefined) return false;
+  return fiber.state === 1 || fiber.state === 2;
+}
+
+/** 找出真正持有根上下文的那个 Context（它自己拥有 data 属性 fiber）。 */
+function contextRoot(ctx) {
+  try {
+    let current = ctx;
+    for (let depth = 0; current && depth <= ELECTION_DEPTH; depth++) {
+      if (typeof current !== "object" && typeof current !== "function") break;
+      const descriptor = Object.getOwnPropertyDescriptor(current, "fiber");
+      if (descriptor && descriptor.value !== undefined) return current.root ?? current;
+      current = Object.getPrototypeOf(current);
+    }
+  } catch {}
+  try { return ctx?.get?.("fiber", false)?.ctx?.root; } catch {}
+  return undefined;
+}
+
+/**
+ * 找到根上下文与进程内的 loader。
+ *
+ * 条目存储树挂在 loader 上（`tree.store`）：loader 本身就是顶层 EntryTree，
+ * 一条顶层 store 加 `entry.subtree` 递归就能走到进程里的每一行。找不到时
+ * 两个字段都是 undefined，调用方按"没有对手"处理。
+ */
+function resident(ctx, mine) {
+  let root;
+  try { root = contextRoot(ctx); } catch {}
+  const usable = (value) => value && typeof value === "object" && value.store && typeof value.store === "object" ? value : undefined;
+  const probes = [
+    () => ctx?.loader,
+    () => ctx?.get?.("loader", false),
+    () => mine?.entry?.loader,
+    () => mine?.entry?.parent?.tree,
+    () => root?.loader,
+    () => root?.get?.("loader", false),
+  ];
+  let loader;
+  for (const probe of probes) {
+    try { loader = usable(probe()); } catch {}
+    if (loader) break;
+  }
+  return { root, loader };
+}
+
+/** 收集进程内所有 loader 条目（含嵌套子组），只读不写。 */
+function collectEntries(ctx, mine) {
+  const entries = [];
+  const seenEntries = new Set();
+  const seenTrees = new Set();
+  const add = (entry, depth) => {
+    if (!entry || typeof entry !== "object" || seenEntries.has(entry)) return;
+    if (entries.length >= ELECTION_ENTRY_LIMIT) return;
+    seenEntries.add(entry);
+    entries.push(entry);
+    if (entry.subtree) visit(entry.subtree, depth + 1);
+  };
+  const visit = (tree, depth) => {
+    if (!tree || typeof tree !== "object" || depth > ELECTION_DEPTH || seenTrees.has(tree)) return;
+    seenTrees.add(tree);
+    const store = tree.store;
+    if (!store || typeof store !== "object") return;
+    let list;
+    try { list = Object.values(store); } catch { return; }
+    for (const entry of list) add(entry, depth);
+  };
+  const { loader } = resident(ctx, mine);
+  visit(loader, 0);
+  return entries;
+}
+
+function isSelfEntry(entry, mine) {
+  if (!mine || !entry) return false;
+  if (mine.entry !== undefined && entry === mine.entry) return true;
+  if (mine.fiber === undefined || mine.fiber === null) return false;
+  return entry.fiber === mine.fiber;
+}
+
+/**
+ * 是否需要被本插件取代的那一行：历史 workbuddy/codebuddy 包，
+ * 以及（知道哪一行是自己时才计入）本包的重复副本。
+ */
+function isRivalOptions(options, id, includeOwn = true) {
+  if (!options || typeof options !== "object") return false;
+  if (options.group) return false;
+  const pkg = packageOf(options.name);
+  if (pkg) {
+    if (OWN_PACKAGES.has(pkg)) return includeOwn;
+    return RIVAL_PACKAGE_PATTERN.test(pkg);
+  }
+  if (!includeOwn) return false;
+  return RIVAL_ID_PATTERN.test(String(id ?? options.id ?? ""));
+}
+
+function rivalEntries(ctx, mine) {
+  const result = [];
+  const includeOwn = mine?.includeOwn !== false;
+  for (const entry of collectEntries(ctx, mine)) {
+    if (isSelfEntry(entry, mine)) continue;
+    const options = entry?.options;
+    if (!isRivalOptions(options, entryIdOf(entry), includeOwn)) continue;
+    result.push(entry);
+  }
+  return result;
+}
+
+/** 停用一行：只改内存里的 options，绝不触发 tree.write()。 */
+function disableEntry(entry) {
+  const options = entry?.options;
+  if (!options || typeof options !== "object") return;
+  try { options.disabled = true; } catch {}
+}
+
+/**
+ * 释放一个 fiber，返回"卸载真正完成"的 Promise（吞掉对手 disposer 的错误）。
+ *
+ * 这一点是与旧版实现的关键差别：`fiber.dispose()` 只把 fiber 标成 disposing，
+ * 它注册的 llm 目录/适配器要等 disposer 跑完（`_unload()`，异步）才被删除。
+ * 因此"释放对手 → 立刻重试注册"必然再撞一次 DUPLICATE_*。
+ */
+function stopFiber(fiber) {
+  if (!fiber || typeof fiber !== "object" || typeof fiber.dispose !== "function") return undefined;
+  let task;
+  try { task = fiber.dispose(); } catch { return undefined; }
+  if (task && typeof task.then === "function") return Promise.resolve(task).then(() => {}, () => {});
+  return Promise.resolve();
+}
+
+/**
+ * 停用所有历史包/重复副本所在的行，返回 `{ released, pending }`。
+ *
+ * `stop: false` 只停用行、不释放 fiber —— 用于"本插件已经抢注成功"的场景：
+ * 此时对手的 fiber 要么已经失败、要么还在 import 途中，释放它没有意义，
+ * 但把行停用可以让启动诊断（inactiveEntries）与客户端包扫描（cm-index）
+ * 直接跳过它，从而不再出现重复注册与重复来源的告警。
+ *
+ * `pending` 是每个被释放 fiber 的卸载完成 Promise，调用方必须等它落地之后
+ * 才能重试注册。
+ */
+function clearRivals(ctx, mine, options = {}) {
+  const stop = options.stop !== false;
+  const pending = [];
+  for (const entry of rivalEntries(ctx, mine)) {
+    const fiber = stop && isLiveFiber(entry.fiber) ? entry.fiber : undefined;
+    disableEntry(entry);
+    if (!fiber) continue;
+    const task = stopFiber(fiber);
+    if (task) pending.push(task);
+  }
+  return { released: pending.length, pending };
+}
+
+/**
+ * 认出"本行"：真实运行时是 loader 条目（`fiber.entry`）；测试或非 loader 场景
+ * 下退化成一份假条目，这样选举逻辑永远有东西可用、也永远知道自己是哪一行。
+ */
+function resolveSelf(ctx, settingsNs) {
+  let fiber;
+  try { fiber = ctx?.fiber; } catch {}
+  let entry;
+  try { entry = fiber?.entry; } catch {}
+  const real = entry && typeof entry === "object" ? entry : undefined;
+  return {
+    entry: real ?? { options: { id: settingsNs, name: ELECTION_OWNER, disabled: false } },
+    fiber,
+    // 认得出自己的真实行，才允许把"本包的重复副本"也当成对手；
+    // 否则（假条目）宁可保守，只处理历史包。
+    includeOwn: Boolean(real),
+  };
+}
+
+/**
+ * 冲突是否来自"provider 已经被别人注册"。
+ * llm 抛的是带 code 的 LlmError；不同版本措辞不同，所以再按正文兜一层。
+ */
+function duplicateOf(error) {
+  if (!error || typeof error !== "object") return false;
+  const code = error.code;
+  if (typeof code === "string" && RIVAL_CONFLICT_CODES.has(code)) return true;
+  const message = typeof error.message === "string" ? error.message : "";
+  if (!message) return false;
+  return /work-?buddy|code-?buddy/i.test(message) && /already (?:registered|declared|present|exists)/i.test(message);
+}
+
+/**
+ * 选举结果。
+ *
+ * 为什么不放在 `ctx.root` 上：根上下文是 ReflectService 的 Proxy，`root` 与其它
+ * 数据属性都没有 provide 定义，`ReflectService.handler.set` 对未 provide 的属性
+ * 直接抛 "cannot set property ... without provide"。而模块级变量按 ESM 语义是
+ * 每个进程一份，正好等价于"进程级选举结果"，比往 Proxy 上塞 symbol 可靠。
+ */
+let elected;
+
+/**
+ * 选出本进程里 WorkBuddy provider 的唯一归属者。
+ * 只有"另一个活着的本包副本"能让我们认输；其它情况都归本插件。
+ */
+function electWorkBuddy(ctx, mine) {
+  const holder = elected;
+  if (holder && isLiveFiber(holder.fiber) && holder.fiber !== mine?.fiber) {
+    return { won: false, owner: holder.owner, reason: "live-owner" };
+  }
+  elected = { owner: ELECTION_OWNER, fiber: mine?.fiber };
+  return { won: true, owner: ELECTION_OWNER };
+}
+
+/** 进程里是否还有没被停用的历史包/重复副本（含"正在 import、fiber 还没建好"的行）。 */
+function rivalLlm(ctx, mine) {
+  try {
+    for (const entry of rivalEntries(ctx, mine)) {
+      if (entry?.options?.disabled === true) continue;
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+/** 停用并释放所有历史包/重复副本，返回 `{ released, pending }`（永不抛）。 */
+const NO_PENDING = Object.freeze({ released: 0, pending: Object.freeze([]) });
+
+function stopRival(ctx, mine) {
+  try { return clearRivals(ctx, mine, { stop: true }); } catch { return NO_PENDING; }
+}
+
+/**
+ * 装一个"守夜"effect：一段时间内周期性复查，保证晚启动的历史包也会被压下去。
+ *
+ * 用 ctx.effect 而不是裸 setInterval，是为了让 fiber 卸载时自动 clearTimeout；
+ * 定时器都 unref，绝不拖住进程退出。整个函数对 ctx 能力缺失完全宽容（测试里的
+ * 假 ctx 没有 effect），失败一律静默 —— 守夜不是功能，不能因为它报错。
+ */
+function armElection(ctx, run) {
+  if (typeof ctx?.effect !== "function" || typeof run !== "function") return;
+  try {
+    ctx.effect(() => {
+      const timers = new Set();
+      const stop = () => {
+        for (const timer of timers) clearTimeout(timer);
+        timers.clear();
+      };
+      let elapsed = 0;
+      for (const delay of ELECTION_TICK_PLAN) {
+        elapsed += delay;
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          try { run(); } catch {}
+        }, elapsed);
+        timer?.unref?.();
+        timers.add(timer);
+      }
+      return stop;
+    }, "workbuddy: election");
+  } catch {}
+}
+
+export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, providerSettings, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor, estimateTextTokens, estimateContextTokens, boundContextBudget, silentContextOverflow, workBuddyApi, packageOf, entryIdOf, isLiveFiber, isRivalOptions, collectEntries, rivalEntries, disableEntry, clearRivals, stopFiber, resolveSelf, duplicateOf, resident, rivalLlm, stopRival, armElection, electWorkBuddy, ELECTION_KEY, ELECTION_OWNER, RECLAIM_ATTEMPTS, RECLAIM_TIMEOUT_MS });
 
 export function apply(ctx, config) {
   const modernSettings = typeof config?.providers?.get === "function";
   const settingsNs = modernSettings ? ctx.fiber?.entry?.options?.id ?? name : NS;
-  installWorkBuddyWeb(ctx, settingsNs);
   let current = () => config;
   const requestContext = new AsyncLocalStorage();
   let remoteModels;
@@ -1069,7 +1387,7 @@ export function apply(ctx, config) {
       try {
         session = await resolveLoginSession();
       } catch (error) {
-        throw new LlmError(`${name}: 未找到可用的 WorkBuddy 登录令牌，请运行 dsh-llm-workbuddy login`, "MISSING_CREDENTIAL", { cause: error });
+        throw new LlmError(`${name}: 未找到可用的 WorkBuddy 登录令牌，请在插件详情里完成登录`, "MISSING_CREDENTIAL", { cause: error });
       }
       context.headers = {
         ...(session.account.userId ? { "X-User-Id": session.account.userId } : {}),
@@ -1230,10 +1548,7 @@ export function apply(ctx, config) {
     }];
   })];
 
-  let directory = ctx.llm.registerConfigurableProviders(directoryEntries());
-  let registration = ctx.llm.registerAdapter([...profiles().keys()], adapter);
-
-  ctx.llm.registerModelDiscovery(settingsNs, async (request, signal) => {
+  const discoverModels = async (request, signal) => {
     const discoverySignal = signal ?? request.signal;
     if (WORKBUDDY_PROVIDERS.has(request.provider)) {
       const profile = profiles().get(request.provider);
@@ -1258,24 +1573,224 @@ export function apply(ctx, config) {
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
     }));
+  };
+
+  /* ── 安装与选举 ────────────────────────────────────────────────────────
+   *
+   * llm 服务的注册是先到先得：第一个注册 "workbuddy-cn" 的 fiber 生效，后来者
+   * 抛 DUPLICATE_*。历史包（dsh-llm-workbuddy / dsh-llm-codebuddy …）与本包的
+   * 重复副本都想要这个 provider，所以"谁先 apply"不该由 YAML 行序决定。
+   *
+   * boot() 把顺序固定成"本插件赢"：先停用对手所在的行，再注册；注册时若仍然
+   * 撞车（对手已经抢注成功），释放对手的 fiber 后重试一次；仍然撞车就认输并
+   * 把自己的行停用，静默退出 —— 绝不半途留一个只注册了一半的状态。
+   */
+  let owned = { directory: undefined, registration: undefined, discovery: undefined };
+  let mine;
+  let booted = false;
+  let healing = false;
+
+  const registerOnce = () => {
+    const providers = [...profiles().keys()];
+    const entries = directoryEntries();
+    if (owned.directory) owned.directory.replace?.(entries);
+    else owned.directory = ctx.llm.registerConfigurableProviders(entries);
+    if (owned.registration) owned.registration.replace?.(providers);
+    else owned.registration = ctx.llm.registerAdapter(providers, adapter);
+    if (!owned.discovery) {
+      const handle = ctx.llm.registerModelDiscovery(settingsNs, discoverModels);
+      owned.discovery = typeof handle === "function" ? handle : () => {};
+    }
+  };
+
+  const releaseRegistrations = () => {
+    for (const key of ["discovery", "registration", "directory"]) {
+      const handle = owned[key];
+      owned[key] = undefined;
+      if (typeof handle !== "function") continue;
+      try { handle(); } catch {}
+    }
+  };
+
+  /** 注册一次；撞车则清掉自己已经注册的部分并返回 false，其它错误照旧抛出。 */
+  const tryRegister = () => {
+    try {
+      registerOnce();
+      return true;
+    } catch (error) {
+      if (!duplicateOf(error)) throw error;
+      releaseRegistrations();
+      return false;
+    }
+  };
+
+  /** 只等一批卸载落地，最多 RECLAIM_TIMEOUT_MS；永不 reject、永不留悬挂定时器。 */
+  const settle = (pending) => {
+    const list = (Array.isArray(pending) ? pending : []).filter((task) => task && typeof task.then === "function");
+    if (list.length === 0) return Promise.resolve();
+    const all = Promise.all(list.map((task) => Promise.resolve(task).then(() => {}, () => {})));
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, RECLAIM_TIMEOUT_MS);
+      timer?.unref?.();
+      all.then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  };
+
+  const pause = (ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer?.unref?.();
   });
+
+  /** 本 fiber 是否还活着（真实运行时被卸载后 uid 置 null，异步分支必须先看这一眼）。 */
+  const stillActive = () => {
+    const fiber = mine?.fiber;
+    if (!fiber || typeof fiber !== "object") return true;
+    return fiber.uid !== null;
+  };
+
+  /**
+   * 对手已经抢注、我们刚把它拆掉：必须等它的 disposer 真正跑完才能重试。
+   *
+   * 目录是 llm 服务上的共享 Map，键是 provider 名；对手的 disposer 做的是
+   * `directory.delete(provider)`，与我们是不是同一个注册句柄无关。所以"先注册、
+   * 后等它卸载"会让对手的清理把**我们**刚登记的键删掉 —— 顺序只能是先等后注册。
+   */
+  const reclaim = async (pending, attempt) => {
+    await settle(pending);
+    await pause(RECLAIM_RETRY_MS);
+    if (!stillActive()) return false;
+    if (tryRegister()) return true;
+    if (attempt >= RECLAIM_ATTEMPTS) return false;
+    return reclaim(stopRival(ctx, mine).pending, attempt + 1);
+  };
+
+  /**
+   * 抢占注册。`true` = 已同步抢到；`false` = 认输；Promise<boolean> = 需要等对手卸载。
+   *
+   * 没有对手时整条路径保持同步：测试里的假 ctx 没有 loader，`rivalLlm` 恒为 false，
+   * `apply()` 返回时注册已经生效。
+   */
+  const installRegistrations = () => {
+    const pending = rivalLlm(ctx, mine) ? stopRival(ctx, mine).pending : NO_PENDING.pending;
+    if (tryRegister()) return true;
+    return reclaim(pending, 1);
+  };
+
+  /**
+   * 迟到的对手：历史包可能在本插件之后才 import 完成（甚至稍后被 loader 拉起）。
+   * 注册冲突发生在对手的 apply 里、不会回调我们，所以额外订阅 llm/adapters-updated
+   * 并在守夜窗口内周期性复查：只要发现对手的行还活着，就把重排推迟一拍执行。
+   * `healing` 贯穿整段工作（含 registerOnce 内部再次触发的 emit），因此不会自激；
+   * 若这一轮要走"等对手卸载"的异步路径，`healing` 会一直握到那次抢占结束，
+   * 期间重复的 emit 全部被折叠掉。
+   */
+  const repair = (force) => {
+    if (!booted || healing) return;
+    if (!force && !rivalLlm(ctx, mine)) return;
+    healing = true;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      healing = false;
+    };
+    Promise.resolve().then(() => {
+      if (!booted) return finish();
+      if (!force && !rivalLlm(ctx, mine)) return finish();
+      const outcome = installRegistrations();
+      if (outcome === true) return finish();
+      if (outcome === false) {
+        disableEntry(mine.entry);
+        return finish();
+      }
+      return Promise.resolve(outcome).then((won) => {
+        if (!won) disableEntry(mine.entry);
+        finish();
+      }, finish);
+    }).catch(finish);
+  };
+  const deferHeal = () => repair(false);
 
   // Keep WorkBuddy out of the settings base layer so it appears in WebUI's
   // "Add provider" dropdown. The runtime profile above still exists as the
   // built-in implementation; selecting it only persists the credential ref.
   const refreshRegistrations = () => {
     memoRaw = undefined;
-    const providers = profiles();
-    registration.replace([...providers.keys()]);
-    directory.replace(directoryEntries());
+    if (!booted) return;
+    if (!owned.registration || !owned.directory) {
+      repair(true);
+      return;
+    }
+    // 有对手在时不能就地 replace：停用对手会让它在异步 disposer 里删掉目录键，
+    // 而目录是共享 Map、按 provider 名删，删掉的会是我们刚写进去的那一份。
+    // 交给 repair 走"先等对手卸载、再重新注册"的正规路径。
+    if (rivalLlm(ctx, mine)) {
+      repair(true);
+      return;
+    }
+    try {
+      owned.registration.replace([...profiles().keys()]);
+      owned.directory.replace(directoryEntries());
+    } catch {
+      // 句柄可能已被释放（对手 reload、fiber 卸载），重建整套注册比静默失效好。
+      repair(true);
+    }
   };
-  if (modernSettings) ctx.on("loader/volatile-update", refreshRegistrations);
-  installSettingsCompat(ctx, settingsNs, Config, config ?? { providers: {} }, {
-    setSource(source) {
-      current = source;
-    },
-    onChange() {
-      refreshRegistrations();
-    },
-  });
+
+  /** 真正赢下之后才做的一次性收尾（Web 路由、设置面板、守夜）。 */
+  const activate = () => {
+    if (booted) return;
+    booted = true;
+    // 只有真正赢下的这一份才挂 Web 路由与设置面板，避免两条 routing 抢同一路径。
+    installWorkBuddyWeb(ctx, settingsNs);
+    if (modernSettings && typeof ctx.on === "function") ctx.on("loader/volatile-update", refreshRegistrations);
+    if (typeof ctx.on === "function") ctx.on("llm/adapters-updated", deferHeal);
+    installSettingsCompat(ctx, settingsNs, Config, config ?? { providers: {}}, {
+      setSource(source) {
+        current = source;
+      },
+      onChange() {
+        refreshRegistrations();
+      },
+    });
+    armElection(ctx, deferHeal);
+  };
+
+  /** 位子被别人占死：停用自己的行（只在内存里）后静默退出。 */
+  const surrender = () => {
+    stopRival(ctx, mine);
+    disableEntry(mine.entry);
+  };
+
+  const boot = () => {
+    mine = resolveSelf(ctx, settingsNs);
+    const election = electWorkBuddy(ctx, mine);
+    if (!election.won) {
+      // 另一个活着的本包副本已经生效：停用自己的行（只在内存里）后静默退出。
+      // 被停用的行不会被 inactiveEntries 诊断、也不会被 refresh() 重新拉起，
+      // 因此不会产生 "did not activate" 告警，也不会再去抢注一次。
+      surrender();
+      return;
+    }
+    const outcome = installRegistrations();
+    if (outcome === true) {
+      activate();
+      return;
+    }
+    if (outcome === false) {
+      surrender();
+      return;
+    }
+    // 对手已经抢注成功：注册要等它卸载完才能落地，只能异步收尾。
+    // apply 本身仍然同步返回，这里只是把"赢下之后做什么"推迟到抢占有结果。
+    Promise.resolve(outcome).then((won) => {
+      if (won && stillActive()) activate();
+      else surrender();
+    }, () => surrender());
+  };
+
+  boot();
 }

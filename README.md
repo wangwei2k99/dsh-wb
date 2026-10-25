@@ -85,13 +85,17 @@ harness credential store 的 `llm-pi-ai/<provider id>` 记录，由宿主负责�
 dsh plugin --profile desktop add @wangwei2k99/dsh-workbuddy@latest
 ```
 
-### Web / Headless
+### Web / Headless / 桌面
 
-一键安装或更新这两个 Profile：
+一键安装或更新**所有已存在的 Profile**：
 
 ```powershell
 npx --yes @wangwei2k99/dsh-workbuddy@latest install
 ```
+
+> 以前这条命令只处理 `web` 和 `headless`，桌面版用的 `desktop` Profile 会被漏掉——
+> 于是 `install` 跑完，日常在用的那个 Profile 里旧插件依然存在。
+> 现在会扫描 `~/.dsh/profiles` 下所有真实的 Profile（含 `desktop`），逐个清理旧包并安装。
 
 仅安装 Web Profile：
 
@@ -104,14 +108,45 @@ dsh plugin --profile web add @wangwei2k99/dsh-workbuddy@latest
 
 > **从旧包名升级**：包名已由 `@axiaohungry/dsh-llm-workbuddy` 改为
 > `@wangwei2k99/dsh-workbuddy`（npm 不允许非 scoped 包名带 `/`，所以要带 `@`）。
-> 先移除旧包再安装新包，两者不要并存：
+> 建议先移除旧包再安装新包：
 >
 > ```powershell
 > dsh plugin --profile desktop remove @axiaohungry/dsh-llm-workbuddy
 > dsh plugin --profile desktop add @wangwei2k99/dsh-workbuddy@latest
 > ```
 >
-> `npx … install` 会自动清理旧包名。
+> `npx … install` 会自动清理旧包名和旧行 id。
+
+### 与旧插件共存时以本插件为准
+
+历史版本（`dsh-llm-workbuddy`、`dsh-llm-codebuddy` 等）与本插件都注册同一个
+provider `workbuddy-cn`，而 DSH 的 llm 注册是先到先得、后到者抛 `DUPLICATE_*`。
+如果机器上还留着旧插件，**不必手动卸载**：本插件启动时会做进程内选举，
+无条件接管 provider 归属。
+
+具体行为：
+
+1. **停用旧行**：把旧插件所在的 loader 行在**内存里**标记为 disabled，并释放它的
+   fiber。不写回 `cordis.yml` / `cordis.patch.yml`，你的配置文件不会被改动。
+2. **等待卸载完成再注册**：fiber 的卸载是异步的（目录键要等 disposer 跑完才删），
+   所以本插件会等旧插件真正卸载完再重新注册，而不是立刻重试。
+3. **守夜窗口**：启动后约 12 秒内周期性复查，处理"比本插件更晚才加载完"的旧插件。
+4. **重复安装**：同一个包装了多行时，只有第一行生效，其余行停用后静默退出，
+   不会再产生重复注册告警。
+5. **HTTP 路由也用新路径**：登录/状态接口由 `/dsh-llm-workbuddy/auth/*` 改为
+   `/dsh-workbuddy/auth/*`，避免和仍在运行的旧插件争抢同一条路由
+   （webserver 对同路径重复注册会直接抛错）。
+6. **设置卡片两种 id 都认**：设置页的扩展卡片按 `settingsNs`（即 loader 行 id）
+   精确匹配，本插件同时注册 `dsh-workbuddy` 和 `llm-workbuddy` 两个 key，
+   按新 id 或旧 id 安装都能显示。
+
+已知边界：
+
+- 只解决**同一进程内**的冲突。两个 DSH 实例各自独立，互不影响。
+- 旧插件如果在守夜窗口结束（约 12 秒）之后才被动态加载，这一次不会被接管，
+  重启 DSH 即可。
+- 被停用的旧行会在启动日志里留下 `unload plugin …`，这是正常现象，不带告警。
+
 
 ## 使用方法
 
@@ -143,19 +178,12 @@ API Key 模式不显示账号令牌积分。
 ### 3. 选择模型
 
 点击“获取可用模型”，选择需要的模型，再点击“保存模型”。
-可按需修改模型名称、上下文窗口、最大输出 Token 和思考档位。
+可按需修改模型名称、使用场景和思考档位。
 
-「上下文窗口」按该模型的上游上限分三档（上限的 1/5、1/2、上限，例如 1M 的模型是
-200K / 500K / 1M）；「最大输出 Token」同样三档（上限的 1/4、1/2、上限，例如
-128K 的模型是 32K / 64K / 128K）。上限来自
-`GET /v3/config` 的 `maxInputTokens` / `maxOutputTokens`，改模型或换账号后重新
-「获取模型」即可刷新。
+使用场景四档：简短问答、日常编码、超长文档、大型项目。选中一档会同时写入上下文窗口和最大输出。前三档是固定工作点，大型项目写入该模型的上游上限。上限来自 `GET /v3/config` 的 `maxInputTokens` / `maxOutputTokens`，改模型或换账号后重新「获取模型」即可刷新。具体数字见 [模型上下文档位实测与建议](docs/模型上下文档位实测与建议.md) 第 5 节。
 
 更换账号或 Key 后，建议重新获取可用模型。手动添加模型时，请确认模型 ID 和账号权限。
 “恢复在线目录”会取消手工覆盖的模型列表。
-
-档位取值的实测与推荐见
-[模型上下文档位实测与建议](docs/模型上下文档位实测与建议.md)。
 
 ### 4. 可选：为会话单独选择凭据
 

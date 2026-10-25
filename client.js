@@ -1,9 +1,9 @@
 window.__ModuleLoader__.load({
   id: "@wangwei2k99/dsh-workbuddy",
   factory: (require) => {
-    const ROUTE = "/dsh-llm-workbuddy/auth";
+    const ROUTE = "/dsh-workbuddy/auth";
     const MARKER = "data-workbuddy-auth-switch";
-    const AUTH_STATE_EVENT = "dsh-llm-workbuddy:auth-state";
+    const AUTH_STATE_EVENT = "dsh-workbuddy:auth-state";
     const PENDING_MARKER = "data-workbuddy-new-session-selector";
     /**
      * 组合包可能仍以旧包名安装（改名前的 profile）。DSH 用依赖名当 bundle 名，
@@ -32,40 +32,23 @@ window.__ModuleLoader__.load({
       return /^modlens-(?:work-?buddy|code-?buddy)(?:-|$)/.test(normalized);
     }
 
-    /**
-     * 上下文窗口档位。200K 为 WorkBuddy 官方默认值，1M 为上限档。
-     * 服务端约 1M 处硬性截断，超出会返回 code 11115。
-     */
-    const CONTEXT_WINDOW_OPTIONS = [
-      { value: 200000, label: "200K", hint: "默认，适用于绝大多数任务" },
-      { value: 500000, label: "500K", hint: "长文档、跨文件分析" },
-      { value: 1000000, label: "1M", hint: "上限档；每轮积分消耗显著增加" },
-    ];
+    /** 没有目录上限时的兜底，与「日常编码」一致。 */
     const DEFAULT_CONTEXT_WINDOW = 200000;
-    /** 上下文窗口下拉的最小宽度，表头与字段共用，保证列对齐。 */
-    const CONTEXT_SELECT_WIDTH = "120px";
-
-    /**
-     * 最大输出 Token 档位。输出与输入共享上下文预算，且推理模型的思考
-     * token 也计入 max_tokens，因此默认不低于 32K。
-     */
-    const MAX_TOKENS_OPTIONS = [
-      { value: 32000, label: "32K", hint: "默认，绝大多数任务；兼顾推理空间" },
-      { value: 64000, label: "64K", hint: "长文件生成、多文件重构" },
-      { value: 128000, label: "128K", hint: "极少数超长输出场景" },
-    ];
     const DEFAULT_MAX_TOKENS = 32000;
+    /** 使用场景下拉的最小宽度：四个中文字 + 箭头 + 留白。 */
+    const PRESET_SELECT_WIDTH = "112px";
+    /** 「窗口 / 输出」列宽，容得下 1M / 128K。 */
+    const BUDGET_COLUMN_WIDTH = "120px";
 
-    /**
-     * 档位取整：1/5、1/2 切出来的值可能是 102400 这种数字，取整到千位再展示。
-     * 误差 < 1%，仍在 5% 的归位容差内，不会让已存的值丢掉档位。
-     */
-    function roundTokenTier(value) {
-      if (!Number.isFinite(value) || value <= 0) return value;
-      return value >= 10000 ? Math.round(value / 1000) * 1000 : Math.round(value);
-    }
+    /** 预设值与已存值的归位容差：5% 以内视为同一档。 */
+    const SNAP_RATIO = 0.05;
 
-    /** 档位标签：1000000 写成 1M，其余按 K 显示（不足整千的保留一位小数）。 */
+    /** 数值不属于任何档位时的占位值。 */
+    const PRESET_CUSTOM = "custom";
+    /** 新添加的模型默认场景。 */
+    const DEFAULT_PRESET = "coding";
+
+    /** 档位标签：1000000 写成 1M，其余整千按 K 显示。 */
     function formatTokenTier(value) {
       if (!Number.isFinite(value) || value <= 0) return "—";
       if (value >= 1000000 && value % 100000 === 0) return `${value / 1000000}M`;
@@ -74,60 +57,131 @@ window.__ModuleLoader__.load({
       return String(value);
     }
 
-    /**
-     * 上下文窗口档位：按该模型的上游上限（maxInputTokens）切三档——1/5、1/2、上限。
-     * 上限来自「获取模型」拿到的目录，拿不到时退回内置档位，保证老配置照样能编辑。
-     */
-    function contextWindowTiers(max) {
-      const ceiling = roundTokenTier(max);
-      if (!Number.isFinite(ceiling) || ceiling <= 0) return CONTEXT_WINDOW_OPTIONS;
-      const values = [...new Set([roundTokenTier(ceiling / 5), roundTokenTier(ceiling / 2), ceiling])]
-        .filter((value) => value > 0)
-        .sort((left, right) => left - right);
-      return values.map((value, index) => ({
-        value,
-        label: formatTokenTier(value),
-        hint: index === values.length - 1
-          ? `上游上限（${formatTokenTier(ceiling)}）；每轮积分消耗最高`
-          : index === 0
-            ? "最小档，按上限 1/5 取；最省积分"
-            : "中间档，按上限 1/2 取；长文档、跨文件分析",
-      }));
+    function formatBudget(contextWindow, maxTokens) {
+      return `${formatTokenTier(contextWindow)} / ${formatTokenTier(maxTokens)}`;
     }
 
     /**
-     * 新模型的输出默认值：取不超过 32K 的最大档，让「默认 32K」的既有约定继续成立
-     * （上限 32K 的模型落在 32K，上限 8K 的模型落在 8K），不出范围。
+     * 四档是任务预算，不是上游上限的比例。
+     * 窗口决定 DSH 何时压缩；输出是单次生成预留，思考 token 也算在里面。
+     * 前三档是工作点：编码大约 200K 内召回还稳，长文放到 300K。
+     * 「大型项目」是显式顶满，窗口和输出都用该模型上游上限。
      */
-    function defaultMaxTokensTier(max) {
-      const tiers = maxTokensTiers(max).map((option) => option.value);
-      const within = tiers.filter((value) => value <= DEFAULT_MAX_TOKENS);
-      return within.at(-1) ?? tiers[0];
+    const TASK_PRESETS = [
+      { id: "chat", label: "简短问答", hint: "几轮对话。窗口留得短，输出只够一段回答加少量思考" },
+      { id: "coding", label: "日常编码", hint: "日常改代码。窗口停在召回还稳的区间，输出留给思考和单文件" },
+      { id: "document", label: "超长文档", hint: "整篇长文放进窗口。输出仍按摘要，不按整篇重写" },
+      { id: "project", label: "大型项目", hint: "顶满该模型的上游窗口和输出上限" },
+    ];
+
+    /**
+     * 未单列的模型共用这套目标，再按该模型自己的 maxInputTokens / maxOutputTokens 截断。
+     * 小窗口模型上较高档会被截成同一组数字，界面只保留先出现的那一档。
+     */
+    const GENERIC_BUDGETS = {
+      chat: { contextWindow: 32000, maxTokens: 16000 },
+      coding: { contextWindow: 200000, maxTokens: 32000 },
+      document: { contextWindow: 300000, maxTokens: 32000 },
+      project: { contextWindow: 1000000, maxTokens: 128000 },
+    };
+
+    /**
+     * 点名模型的前三档不走通用表。
+     * Kimi 网关输出天花板是 32K。Highspeed 前三档窗口更紧，避免预填延迟吃掉速度优势。
+     * GLM-5.3 不能关思考，官方编码预算常用 64K 输出，长上下文评测停在 300K。
+     * 最高档不写死在表里：目录返回后直接用该模型的 maxInputTokens 和 maxOutputTokens。
+     * 下面的 project 只在目录还没到时兜底。
+     */
+    const MODEL_BUDGETS = {
+      "deepseek-v4.1-flash": {
+        chat: { contextWindow: 32000, maxTokens: 16000 },
+        coding: { contextWindow: 200000, maxTokens: 32000 },
+        document: { contextWindow: 300000, maxTokens: 32000 },
+        project: { contextWindow: 1000000, maxTokens: 128000 },
+      },
+      "kimi-k3.1-pro": {
+        chat: { contextWindow: 32000, maxTokens: 16000 },
+        coding: { contextWindow: 200000, maxTokens: 32000 },
+        document: { contextWindow: 300000, maxTokens: 32000 },
+        project: { contextWindow: 1000000, maxTokens: 32000 },
+      },
+      "kimi-k3.1-pro-highspeed": {
+        chat: { contextWindow: 32000, maxTokens: 16000 },
+        coding: { contextWindow: 128000, maxTokens: 32000 },
+        document: { contextWindow: 256000, maxTokens: 32000 },
+        project: { contextWindow: 1000000, maxTokens: 32000 },
+      },
+      "glm-5.3": {
+        chat: { contextWindow: 64000, maxTokens: 32000 },
+        coding: { contextWindow: 200000, maxTokens: 64000 },
+        document: { contextWindow: 300000, maxTokens: 64000 },
+        project: { contextWindow: 1000000, maxTokens: 128000 },
+      },
+    };
+
+    function canonicalModelId(id) {
+      return String(id ?? "").trim().toLowerCase();
+    }
+
+    /** 目标值不超过该模型上游上限，输出也不超过窗口。 */
+    function clampBudget(budget, capabilities) {
+      const inputCap = capabilities?.contextWindow;
+      const outputCap = capabilities?.maxTokens;
+      let contextWindow = budget.contextWindow;
+      let maxTokens = budget.maxTokens;
+      if (Number.isSafeInteger(inputCap) && inputCap > 0) contextWindow = Math.min(contextWindow, inputCap);
+      if (Number.isSafeInteger(outputCap) && outputCap > 0) maxTokens = Math.min(maxTokens, outputCap);
+      maxTokens = Math.min(maxTokens, contextWindow);
+      return { contextWindow, maxTokens };
+    }
+
+    function presetBudget(modelId, presetId, capabilities) {
+      const table = MODEL_BUDGETS[canonicalModelId(modelId)] ?? GENERIC_BUDGETS;
+      const budget = table[presetId] ?? GENERIC_BUDGETS[presetId];
+      if (!budget) return null;
+      if (presetId !== "project") return clampBudget(budget, capabilities);
+      const inputCap = Number.isSafeInteger(capabilities?.contextWindow) && capabilities.contextWindow > 0
+        ? capabilities.contextWindow
+        : budget.contextWindow;
+      const outputCap = Number.isSafeInteger(capabilities?.maxTokens) && capabilities.maxTokens > 0
+        ? capabilities.maxTokens
+        : budget.maxTokens;
+      return { contextWindow: inputCap, maxTokens: Math.min(outputCap, inputCap) };
     }
 
     /**
-     * 最大输出档位：按该模型的上游上限（maxOutputTokens）切三档——1/4、1/2、上限。
-     * 上限来自「获取模型」拿到的目录；拿不到时退回内置档位。
-     * 超过上限的值不展示——上游不会报错，只会静默截断。
+     * 该模型点得动的档位。截断后数字相同的档只留靠前的一个，
+     * 否则点「超长文档」会被反推成「日常编码」。
      */
-    function maxTokensTiers(max) {
-      const ceiling = roundTokenTier(max);
-      if (!Number.isFinite(ceiling) || ceiling <= 0) return MAX_TOKENS_OPTIONS;
-      const values = [...new Set([roundTokenTier(ceiling / 4), roundTokenTier(ceiling / 2), ceiling])]
-        .filter((value) => value > 0)
-        .sort((left, right) => left - right);
-      return values.map((value, index) => ({
-        value,
-        label: formatTokenTier(value),
-        hint: index === values.length - 1
-          ? `上游上限（${formatTokenTier(ceiling)}）；输出与输入共享上下文窗口`
-          : index === 0
-            ? "最小档，按上限 1/4 取；响应最快、最省积分"
-            : "中间档，按上限 1/2 取；长文件生成、多文件重构",
-      }));
+    function modelPresetOptions(modelId, capabilities) {
+      const options = [];
+      const seen = new Set();
+      for (const preset of TASK_PRESETS) {
+        const values = presetBudget(modelId, preset.id, capabilities);
+        if (!values) continue;
+        const signature = `${values.contextWindow}:${values.maxTokens}`;
+        if (seen.has(signature)) continue;
+        seen.add(signature);
+        options.push({
+          id: preset.id,
+          label: preset.label,
+          hint: `${preset.hint}（${formatBudget(values.contextWindow, values.maxTokens)}）`,
+          ...values,
+        });
+      }
+      return options;
     }
-    /** 最大输出 Token 下拉的最小宽度，表头与字段共用。 */
-    const MAX_TOKENS_SELECT_WIDTH = "110px";
+
+    /** 反推当前窗口和输出属于哪一档；对不上就是「自定义」。 */
+    function matchModelPreset(model, capabilities) {
+      const near = (left, right) => Number.isFinite(left) && Number.isFinite(right)
+        && Math.abs(left - right) <= right * SNAP_RATIO;
+      const hit = modelPresetOptions(model?.id, capabilities).find(
+        (option) => near(model?.contextWindow, option.contextWindow) && near(model?.maxTokens, option.maxTokens),
+      );
+      return hit ? hit.id : PRESET_CUSTOM;
+    }
+
     /** 模型列表“操作”列宽度（删除按钮所在列），表头与数据行共用。 */
     const MODEL_ACTION_COLUMN_WIDTH = 64;
     /**
@@ -183,7 +237,7 @@ window.__ModuleLoader__.load({
     const FOCUS_RING = "0 0 0 3px color-mix(in srgb, var(--dsw-alias-brand-primary, #4f8ff7) 22%, transparent)";
 
     /** 挂载一次性的样式表，承载 :hover / :focus-visible 等内联写法无法表达的状态。 */
-    const STYLE_ID = "dsh-llm-workbuddy-style";
+    const STYLE_ID = "dsh-workbuddy-style";
     function ensureStyles() {
       if (typeof document === "undefined") return;
       if (document.getElementById(STYLE_ID)) return;
@@ -306,7 +360,7 @@ window.__ModuleLoader__.load({
   flex-direction: column;
   width: max-content;
   min-width: 120px;
-  max-width: min(240px, calc(100vw - 32px));
+  max-width: min(280px, calc(100vw - 32px));
   max-height: min(360px, calc(100vh - 96px));
   padding: 4px;
   overflow: hidden;
@@ -349,6 +403,11 @@ window.__ModuleLoader__.load({
   white-space: nowrap;
   min-width: 0;
   flex: auto;
+}
+[data-workbuddy-context-window] .wb-cw-option-detail {
+  flex: none;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary, #9aa3b2);
 }
 [data-workbuddy-context-window] .wb-cw-check {
   display: grid;
@@ -1063,10 +1122,10 @@ window.__ModuleLoader__.load({
     }
 
     function installComposerDockLayout() {
-      if (typeof document === "undefined" || document.querySelector('style[data-plugin-css="dsh-llm-workbuddy-composer-dock"]')) return;
+      if (typeof document === "undefined" || document.querySelector('style[data-plugin-css="dsh-workbuddy-composer-dock"]')) return;
       const style = document.createElement("style");
       style.dataset.plugin = "@wangwei2k99/dsh-workbuddy";
-      style.dataset.pluginCss = "dsh-llm-workbuddy-composer-dock";
+      style.dataset.pluginCss = "dsh-workbuddy-composer-dock";
       style.textContent = `
 [data-slot="conversation.composer.dock"]:has(> [data-composer-stats]),
 [data-slot="conversation.composer.dock"]:has(> [data-workbuddy-credits]) {
@@ -1681,95 +1740,60 @@ window.__ModuleLoader__.load({
         return input;
       };
       /**
-       * 通用档位下拉。值命中预设（含 5% 容差）时只列预设，否则追加
-       * 一个“当前自定义值”选项，避免同一标签出现两次。
+       * 使用场景下拉。选中一档就同时写入该模型的 contextWindow 和 maxTokens。
+       * 存量值对不上任何一档时追加「自定义」，避免看起来像已经是某一档。
        */
-      const makeOptionSelect = ({ model, key, label, hint, options, fallback, ariaLabel }) => {
+      const makePresetSelect = (model, capabilities, onBudget) => {
         const select = document.createElement("select");
-        select.setAttribute("aria-label", ariaLabel);
-        select.title = hint;
+        select.setAttribute("aria-label", `${model.id} 使用场景`);
         Object.assign(select.style, {
-          // 高度与 composer 工具栏控件一致（约 28px），不再用表单输入的 36px。
           minHeight: "28px",
           minWidth: "0",
           height: "28px",
           boxSizing: "border-box",
           padding: "0 6px",
           borderRadius: "6px",
-          // 无边框、透明底，靠 SELECT_ARROW_STYLE 统一（见其注释）。
           color: "var(--dsw-alias-label-secondary, currentColor)",
           font: "inherit",
           fontSize: "12px",
           cursor: "pointer",
           transition: "background-color 140ms ease",
         });
-        // 与 API Key 下拉同一套箭头样式（会覆盖 border/background 为透明）。
         Object.assign(select.style, SELECT_ARROW_STYLE);
-        const raw = model[key];
-        const current = Number.isFinite(raw) && raw > 0 ? raw : fallback;
-        const snapped = snapToOptions(options, current);
-        const entries = snapped !== null
-          ? [...options]
-          : [...options, { value: current, label: exactOptionLabel(current), hint: "当前自定义值" }];
+        const options = modelPresetOptions(model.id, capabilities);
+        const matched = matchModelPreset(model, capabilities);
+        const entries = matched === PRESET_CUSTOM
+          ? [...options, {
+            id: PRESET_CUSTOM,
+            label: "自定义",
+            hint: `当前 ${formatBudget(model.contextWindow, model.maxTokens)}，不属于四档`,
+          }]
+          : options;
         for (const entry of entries) {
           const option = document.createElement("option");
-          option.value = String(entry.value);
+          option.value = entry.id;
           option.textContent = entry.label;
           if (entry.hint) option.title = entry.hint;
           select.append(option);
         }
-        select.value = String(snapped ?? current);
-        // 面板中的编辑只改内存副本，点“保存模型”才落盘。此处补默认值，
-        // 让下拉显示与最终保存的值保持一致。
-        if (model[key] === undefined) model[key] = current;
+        select.value = matched;
+        select.title = entries.find((entry) => entry.id === matched)?.hint ?? "使用场景";
         select.addEventListener("change", () => {
-          model[key] = Number(select.value);
+          const picked = options.find((entry) => entry.id === select.value);
+          if (!picked) return;
+          model.contextWindow = picked.contextWindow;
+          model.maxTokens = picked.maxTokens;
+          select.title = picked.hint;
+          onBudget(picked);
         });
         return select;
-      };
-      /** 上下文窗口下拉：按该模型上游上限切 1/5、1/2、上限三档。 */
-      const makeContextWindowSelect = (model) => {
-        const ceiling = caps[model.id]?.contextWindow;
-        // 存量配置可能比上限还大（例如改过模型目录），这里直接收敛，保存时一并落盘。
-        if (Number.isFinite(ceiling) && Number.isFinite(model.contextWindow) && model.contextWindow > ceiling) {
-          model.contextWindow = ceiling;
-        }
-        const options = contextWindowTiers(ceiling);
-        return makeOptionSelect({
-          model,
-          key: "contextWindow",
-          label: "上下文窗口",
-          hint: "上下文窗口；窗口越大，每轮消耗的积分越多",
-          options,
-          // 没有存量值时落到最小档（1/5），与「添加模型」的默认保持一致。
-          fallback: options[0]?.value ?? DEFAULT_CONTEXT_WINDOW,
-          ariaLabel: "上下文窗口",
-        });
-      };
-      /** 最大输出 Token 下拉：按该模型上游上限切 1/4、1/2、上限三档。 */
-      const makeMaxTokensSelect = (model) => {
-        const ceiling = caps[model.id]?.maxTokens;
-        if (Number.isFinite(ceiling) && Number.isFinite(model.maxTokens) && model.maxTokens > ceiling) {
-          model.maxTokens = ceiling;
-        }
-        const options = maxTokensTiers(ceiling);
-        return makeOptionSelect({
-          model,
-          key: "maxTokens",
-          label: "最大输出 Token",
-          hint: "单次响应的输出上限；输出与输入共享上下文预算",
-          options,
-          // 没有存量值时取「不超过 32K 的最大档」，与「添加模型」的默认保持一致。
-          fallback: defaultMaxTokensTier(ceiling) ?? DEFAULT_MAX_TOKENS,
-          ariaLabel: "最大输出 Token",
-        });
       };
       /**
        * 表头与数据行共用同一套网格列定义，保证逐列对齐。
        * 前两列等分剩余空间，其余为固定宽度。
        */
       // 图片输入列只放一个勾选框，因此列宽可以收紧。
-      const MODEL_GRID_COLUMNS = `minmax(0, 1fr) minmax(0, 1fr) ${CONTEXT_SELECT_WIDTH} ${MAX_TOKENS_SELECT_WIDTH} 72px ${MODEL_ACTION_COLUMN_WIDTH}px`;
+      const MODEL_GRID_COLUMNS = `minmax(0, 1fr) minmax(0, 1fr) ${PRESET_SELECT_WIDTH} ${BUDGET_COLUMN_WIDTH} 72px ${MODEL_ACTION_COLUMN_WIDTH}px`;
       /** 网格最小宽度：两列弹性字段各留 140px 可读宽度。 */
       const MODEL_GRID_MIN_WIDTH = "720px";
       const modelGridStyle = (element) => {
@@ -1814,8 +1838,8 @@ window.__ModuleLoader__.load({
         header.append(
           label("模型 ID"),
           label("显示名称"),
-          label("上下文窗口"),
-          label("最大输出 Token"),
+          label("使用场景"),
+          label("窗口 / 输出"),
           label("图片输入", "center"),
           label("操作", "center"),
         );
@@ -1847,13 +1871,35 @@ window.__ModuleLoader__.load({
           });
           id.title = "模型 ID 不可修改";
           const name = makeInput(model.name, "显示名称", (value) => { model.name = value; });
-          const context = makeContextWindowSelect(model);
-          const output = makeMaxTokensSelect(model);
-          for (const input of [id, name, context, output]) {
+          const capabilities = caps[model.id] ?? {};
+          if (Number.isFinite(capabilities.contextWindow) && model.contextWindow > capabilities.contextWindow) {
+            model.contextWindow = capabilities.contextWindow;
+          }
+          if (Number.isFinite(capabilities.maxTokens) && model.maxTokens > capabilities.maxTokens) {
+            model.maxTokens = capabilities.maxTokens;
+          }
+          if (!Number.isSafeInteger(model.contextWindow) || !Number.isSafeInteger(model.maxTokens)) {
+            const budget = presetBudget(model.id, DEFAULT_PRESET, capabilities);
+            model.contextWindow = budget.contextWindow;
+            model.maxTokens = budget.maxTokens;
+          }
+          const params = document.createElement("span");
+          params.textContent = formatBudget(model.contextWindow, model.maxTokens);
+          params.title = "上下文窗口 / 最大输出";
+          Object.assign(params.style, {
+            fontSize: "12px",
+            color: "var(--dsw-alias-label-secondary, currentColor)",
+            whiteSpace: "nowrap",
+          });
+          const context = makePresetSelect(model, capabilities, (picked) => {
+            params.textContent = formatBudget(picked.contextWindow, picked.maxTokens);
+          });
+          for (const input of [id, name, context]) {
             input.style.minWidth = "0";
             input.style.width = "100%";
             fields.append(input);
           }
+          fields.append(params);
           const imageLabel = document.createElement("label");
           const images = document.createElement("input");
           images.type = "checkbox";
@@ -1984,13 +2030,15 @@ window.__ModuleLoader__.load({
           const addSelected = primaryButton("添加选中模型");
           addSelected.addEventListener("click", () => {
             models ??= [];
-            // 新模型落到最小档：上下文窗口取该模型上限的 1/5，输出取不超过 32K 的最大档。
-            // 上游目录给的是「能力上限」，不是合理默认值——窗口越大，每轮随行历史越多，积分越高。
-            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => ({
-              ...model,
-              contextWindow: contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW,
-              maxTokens: defaultMaxTokensTier(caps[model.id]?.maxTokens) ?? DEFAULT_MAX_TOKENS,
-            })));
+            // 新模型默认「日常编码」。目录里的数字是上游天花板，不是工作值。
+            models.push(...choices.filter((model) => selected.has(model.id)).map((model) => {
+              const budget = presetBudget(model.id, DEFAULT_PRESET, caps[model.id]);
+              return {
+                ...model,
+                contextWindow: budget?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+                maxTokens: budget?.maxTokens ?? DEFAULT_MAX_TOKENS,
+              };
+            }));
             candidates.replaceChildren();
             render();
           });
@@ -2117,30 +2165,9 @@ window.__ModuleLoader__.load({
       });
     }
 
-    const SNAP_RATIO = 0.05;
-
-    /** 把近似值归到最近的预设档位；不匹配时返回 null。 */
-    function snapToOptions(options, value) {
-      if (!Number.isFinite(value) || value <= 0) return null;
-      const match = options.find(
-        (option) => Math.abs(option.value - value) <= option.value * SNAP_RATIO,
-      );
-      return match ? match.value : null;
-    }
-
-    /** 自定义值标签：与预设标签区分，例如 1000000 显示为 1000K 而不是 1M。 */
-    function exactOptionLabel(value) {
-      if (!Number.isFinite(value) || value <= 0) return "默认";
-      if (value % 1000 === 0) return `${value / 1000}K`;
-      return String(value);
-    }
-
-    const snapContextWindow = (value, options = CONTEXT_WINDOW_OPTIONS) => snapToOptions(options, value);
-    const exactContextWindow = exactOptionLabel;
-
     /**
-     * 输入框工具行的上下文窗口选择器。
-     * 直接改写当前 WorkBuddy 模型的 contextWindow，供 DSH 计算压缩阈值。
+     * 输入框工具行的使用场景选择器。
+     * 选中一档后同时改写 contextWindow 和 maxTokens。
      */
     function WorkBuddyContextWindowControl({ useProjection, sessionId }) {
       let selection;
@@ -2153,8 +2180,10 @@ window.__ModuleLoader__.load({
       const selected = isWorkBuddyProvider(provider);
       const modelId = selection?.next?.model ?? selection?.lastUsed?.model ?? selection?.model;
       const [value, setValue] = useState(null);
-      // 该模型的上游上下文上限（maxInputTokens），用于生成 1/5、1/2、上限三档。
+      const [tokens, setTokens] = useState(null);
+      // 上游天花板，用来把四档目标截断到该模型真正能装下的范围。
       const [ceiling, setCeiling] = useState(null);
+      const [outputCeiling, setOutputCeiling] = useState(null);
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState(null);
       // 菜单开合状态必须与上面几个 hook 一起声明在 early return 之前：
@@ -2167,18 +2196,24 @@ window.__ModuleLoader__.load({
         let disposed = false;
         if (!selected || !modelId) {
           setValue(null);
+          setTokens(null);
           setCeiling(null);
+          setOutputCeiling(null);
           return () => { disposed = true; };
         }
         authRequest("context-window", undefined, undefined, { model: modelId })
           .then((result) => {
             if (disposed) return;
             setValue(typeof result?.contextWindow === "number" ? result.contextWindow : DEFAULT_CONTEXT_WINDOW);
+            setTokens(typeof result?.maxTokens === "number" ? result.maxTokens : DEFAULT_MAX_TOKENS);
             setCeiling(typeof result?.contextWindowMax === "number" && result.contextWindowMax > 0 ? result.contextWindowMax : null);
-          })          .catch(() => {
+            setOutputCeiling(typeof result?.maxTokensMax === "number" && result.maxTokensMax > 0 ? result.maxTokensMax : null);
+          }).catch(() => {
             if (disposed) return;
             setValue(DEFAULT_CONTEXT_WINDOW);
+            setTokens(DEFAULT_MAX_TOKENS);
             setCeiling(null);
+            setOutputCeiling(null);
           });
         return () => { disposed = true; };
       }, [selected, modelId]);
@@ -2200,40 +2235,52 @@ window.__ModuleLoader__.load({
         };
       }, [open]);
 
-      if (!selected || !modelId || value === null) return null;
+      if (!selected || !modelId || value === null || tokens === null) return null;
 
-      const apply = async (next) => {
-        if (busy || next === value) return;
-        const previous = value;
+      const capabilities = { contextWindow: ceiling, maxTokens: outputCeiling };
+      const apply = async (budget) => {
+        if (busy || (budget.contextWindow === value && budget.maxTokens === tokens)) return;
+        const previous = { contextWindow: value, maxTokens: tokens };
         setBusy(true);
         setError(null);
-        setValue(next);
+        setValue(budget.contextWindow);
+        setTokens(budget.maxTokens);
         try {
-          await authRequest("context-window", { model: modelId, contextWindow: next });
+          await authRequest("context-window", {
+            model: modelId,
+            contextWindow: budget.contextWindow,
+            maxTokens: budget.maxTokens,
+          });
           if (typeof window !== "undefined") window.dispatchEvent(new Event(AUTH_STATE_EVENT));
         } catch (cause) {
-          setValue(previous);
-          setError(cause instanceof Error ? cause.message : "设置上下文窗口失败");
+          setValue(previous.contextWindow);
+          setTokens(previous.maxTokens);
+          setError(cause instanceof Error ? cause.message : "设置使用场景失败");
         } finally {
           setBusy(false);
         }
       };
 
-      const tiers = contextWindowTiers(ceiling);
-      const snapped = snapContextWindow(value, tiers);
-      const displayValue = snapped ?? value;
-      const options = snapped !== null
-        ? tiers
-        : [...tiers, { value, label: exactContextWindow(value), hint: "当前自定义值" }];
-      const current = options.find((option) => option.value === displayValue) ?? options[0];
+      const presets = modelPresetOptions(modelId, capabilities);
+      const matched = matchModelPreset({ id: modelId, contextWindow: value, maxTokens: tokens }, capabilities);
+      const options = matched === PRESET_CUSTOM
+        ? [...presets, {
+          id: PRESET_CUSTOM,
+          label: "自定义",
+          hint: `当前 ${formatBudget(value, tokens)}，不属于四档`,
+          contextWindow: value,
+          maxTokens: tokens,
+        }]
+        : presets;
+      const current = options.find((option) => option.id === matched) ?? options[0];
 
       // 结构照抄 DSH 官方 PermissionSelect：trigger 按钮 + 向上弹出的 Menu。
       // 官方用 ui-primitives 的 Menu 组件，但那是 shell 内部模块、插件无法 require，
       // 因此这里用同样的 DOM/CSS 自行实现弹出层，视觉与交互保持一致。
-      const choose = (next) => {
+      const choose = (option) => {
         setOpen(false);
-        if (next === displayValue) return;
-        void apply(next);
+        if (!option || option.id === PRESET_CUSTOM || option.id === matched) return;
+        void apply(option);
       };
 
       return createElement("div", {
@@ -2241,8 +2288,8 @@ window.__ModuleLoader__.load({
         ref: rootRef,
         "data-workbuddy-context-window": true,
         role: "group",
-        "aria-label": "WorkBuddy 上下文窗口",
-        title: error ?? "选择上下文窗口：窗口越大，每轮消耗的积分越多",
+        "aria-label": "WorkBuddy 使用场景",
+        title: error ?? current.hint,
         style: {
           position: "relative",
           display: "inline-flex",
@@ -2256,7 +2303,7 @@ window.__ModuleLoader__.load({
           className: "wb-cw-trigger",
           "aria-haspopup": "menu",
           "aria-expanded": open,
-          "aria-label": `上下文窗口：${current.label}`,
+          "aria-label": `使用场景：${current.label}`,
           disabled: busy,
           style: error
             ? { color: "var(--dsw-alias-state-error-primary, #f25a5a)" }
@@ -2283,18 +2330,19 @@ window.__ModuleLoader__.load({
           key: "menu",
           className: "wb-cw-menu",
           role: "menu",
-          "aria-label": "上下文窗口档位",
+          "aria-label": "使用场景",
         }, options.map((option) => createElement("button", {
-          key: String(option.value),
+          key: option.id,
           type: "button",
           role: "menuitemradio",
-          "aria-checked": option.value === displayValue,
-          className: option.value === displayValue ? "wb-cw-option is-selected" : "wb-cw-option",
+          "aria-checked": option.id === matched,
+          className: option.id === matched ? "wb-cw-option is-selected" : "wb-cw-option",
           title: option.hint,
-          onClick: () => choose(option.value),
+          onClick: () => choose(option),
         }, [
           createElement("span", { key: "text", className: "wb-cw-option-text" }, option.label),
-          option.value === displayValue && createElement("span", {
+          createElement("span", { key: "detail", className: "wb-cw-option-detail" }, formatBudget(option.contextWindow, option.maxTokens)),
+          option.id === matched && createElement("span", {
             key: "check",
             className: "wb-cw-check",
             "aria-hidden": true,
@@ -2315,13 +2363,20 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       ensureStyles();
       installComposerDockLayout();
-      ctx.slots.inject("settings.models.provider-card", () => ctx.slots.register({
-        name: "settings.models.provider-card",
-        key: "llm-workbuddy",
-      }, WorkBuddySettingsCard));
+      /**
+       * 这个 slot 是 keyed 的，key 必须等于目录行的 settingsNs——也就是本插件
+       * 在 loader 里的 entry id。用户可能是按新 id（dsh-workbuddy）装，也可能是
+       * 改名前的旧 id（llm-workbuddy），两个都注册，卡片才不会因为 id 不同而消失。
+       */
+      for (const key of ["dsh-workbuddy", "llm-workbuddy"]) {
+        ctx.slots.inject("settings.models.provider-card", () => ctx.slots.register({
+          name: "settings.models.provider-card",
+          key,
+        }, WorkBuddySettingsCard));
+      }
       ctx.slots.inject("plugins.detail.section", () => ctx.slots.register({
         name: "plugins.detail.section",
-        id: "llm-workbuddy",
+        id: "dsh-workbuddy",
       }, WorkBuddyPluginDetails));
       ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
         name: "conversation.composer.dock",
@@ -2355,6 +2410,6 @@ window.__ModuleLoader__.load({
       }, "llm-workbuddy: auth switch");
     }
 
-    return { name: "dsh-llm-workbuddy-client", inject: ["slots"], apply };
+    return { name: "dsh-workbuddy-client", inject: ["slots"], apply };
   },
 });

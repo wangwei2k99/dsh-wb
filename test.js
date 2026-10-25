@@ -316,8 +316,8 @@ test("认证模式写入新旧 DSH 各自的配置命名空间", async () => {
 test("新版 WorkBuddy 卡片保留旧版认证入口并提供模型编辑", () => {
   const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
   assert.match(client, /settings\.models\.provider-card/);
-  assert.match(client, /key: "llm-workbuddy"/);
-  assert.match(client, /name: "plugins\.detail\.section",\s*id: "llm-workbuddy"/);
+  assert.match(client, /for \(const key of \["dsh-workbuddy", "llm-workbuddy"\]\)/);
+  assert.match(client, /name: "plugins\.detail\.section",\s*id: "dsh-workbuddy"/);
   assert.match(client, /mount\(input\)/);
   assert.match(client, /mountModelEditor\(models\)/);
   assert.equal(webTesting.validModelOverrides([{ id: "glm-5.3", contextWindow: 262144, maxTokens: 32768 }]), true);
@@ -346,12 +346,12 @@ test("新版模型接口只修改 WorkBuddy 条目并保留认证模式", async 
     webServer: { register: ({ path, handler }) => { routes.set(path, handler); return () => {}; } },
     effect: (callback) => callback(),
   }) }, "llm-workbuddy");
-  const handler = routes.get("/dsh-llm-workbuddy/auth/models");
+  const handler = routes.get("/dsh-workbuddy/auth/models");
   async function call(method, body) {
     let response;
     const req = {
       method,
-      url: "/dsh-llm-workbuddy/auth/models",
+      url: "/dsh-workbuddy/auth/models",
       socket: { remoteAddress: "127.0.0.1" },
       headers: { origin: "http://localhost:3000" },
       async *[Symbol.asyncIterator]() { if (body) yield Buffer.from(JSON.stringify(body)); },
@@ -413,25 +413,30 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   assert.match(client, /function scheduleEnhance\(\)/);
   assert.match(client, /new MutationObserver\(scheduleEnhance\)/);
   assert.match(client, /ctx\.slots\.inject\("plugins\.detail\.section"/);
-  // 添加模型落到最小档：上下文窗口取上限 1/5，输出取上限 1/4。
+  // 添加模型默认「日常编码」，并按该模型上游上限截断，不再按比例切档。
   assert.ok(
-    client.includes("contextWindowTiers(caps[model.id]?.contextWindow)[0]?.value ?? DEFAULT_CONTEXT_WINDOW")
-    && client.includes("defaultMaxTokensTier(caps[model.id]?.maxTokens) ?? DEFAULT_MAX_TOKENS"),
-    "添加模型时应落到该模型上限的 1/5 与不超过 32K 的最大档",
+    client.includes("presetBudget(model.id, DEFAULT_PRESET, caps[model.id])"),
+    "添加模型时应落到日常编码档",
   );
-  // 档位按上游上限切分：上下文窗口 1/5、1/2、上限；最大输出 1/4、1/2、上限。
-  assert.match(client, /function contextWindowTiers\(max\)/);
-  assert.match(client, /roundTokenTier\(ceiling \/ 5\), roundTokenTier\(ceiling \/ 2\), ceiling/);
-  assert.match(client, /function maxTokensTiers\(max\)/);
-  assert.match(client, /roundTokenTier\(ceiling \/ 4\), roundTokenTier\(ceiling \/ 2\), ceiling/);
+  assert.match(client, /label: "简短问答"/);
+  assert.match(client, /label: "日常编码"/);
+  assert.match(client, /label: "超长文档"/);
+  assert.match(client, /label: "大型项目"/);
+  assert.match(client, /"deepseek-v4\.1-flash"/);
+  assert.match(client, /"kimi-k3\.1-pro"/);
+  assert.match(client, /"kimi-k3\.1-pro-highspeed"/);
+  assert.match(client, /"glm-5\.3"/);
+  assert.doesNotMatch(client, /ceiling \/ 5/);
+  assert.doesNotMatch(client, /ceiling \/ 4/);
   assert.match(web, /contextWindowMax: cap\?\.contextWindow/);
+  assert.match(web, /maxTokens: body\.maxTokens/);
   assert.match(web, /catalog: await catalogCaps\(\)/);
   assert.match(client, /subject\?\.kind === "bundle" && BUNDLE_NAMES\.has\(subject\.pkg\?\.name\)/);
   assert.match(index, /const legacyAdapter = typeof adapter\.prepareCall !== "function"/);
   assert.match(index, /adapter\.prepareCall = async \(provider, model, signal\)/);
   assert.match(index, /persistDefaultSessionBinding/);
   assert.match(index, /bindings: \{ \.\.\.latest\.bindings, \[sessionId\]: binding \}/);
-  assert.match(web, /path: `\$\{ROUTE\}\/unbind`/);
+  assert.match(web, /take\(`\$\{ROUTE\}\/unbind`, unbind\)/);
   assert.match(web, /const effectiveBinding = sessionBinding;/);
   assert.match(web, /const displayedBinding = effectiveBinding \?\? suggestedBinding/);
 });
@@ -1153,7 +1158,8 @@ test("客户端 bundle 可加载且 apply 能注册全部槽位", async () => {
 
     const ids = registered.map((r) => r.id).sort();
     assert.deepEqual(ids, [
-      "llm-workbuddy",
+      "dsh-workbuddy",
+      "dsh-workbuddy",
       "llm-workbuddy",
       "workbuddy-context-window",
       "workbuddy-credits",
@@ -1218,3 +1224,153 @@ test("token 估算对代理对与全角字符的计数与逐 code point 遍历�
     );
   }
 });
+
+/* ─────────────── 与历史插件共存：识别对手、停用、异步抢占 ───────────────
+ *
+ * 这些用例守住"装了历史包也以本插件为准"的语义。真实运行时里 llm 的注册是
+ * 先到先得、后到者抛 DUPLICATE_*，而 fiber 的卸载是异步的（目录键要等 disposer
+ * 跑完才删），所以这里同时覆盖：识别（isRivalOptions）、停用（clearRivals）、
+ * 以及"必须等卸载落地才能重试"的顺序约束。
+ */
+
+/** 造一棵和 loader 同形的条目树：{ store: { [id]: { options, fiber, subtree } } }。 */
+function fakeLoader(rows) {
+  const store = Object.create(null);
+  for (const row of rows) store[row.options.id] = { options: row.options, fiber: row.fiber, subtree: row.subtree };
+  return { store };
+}
+
+/** 造一个能被 ctx.loader 取到的假 ctx（resident 认 store 形态）。 */
+function ctxWith(loader, extra = {}) {
+  return { loader, get: () => undefined, ...extra };
+}
+
+test("识别需要被取代的行：历史包一律算，非 loader 形态下不误伤其它插件", () => {
+  const { isRivalOptions } = __testing;
+
+  // 历史包写法各异的包名与 id 都要认出来。
+  for (const name of ["dsh-llm-workbuddy", "@scope/dsh-llm-workbuddy", "dsh-llm-codebuddy", "workbuddy", "@x/codebuddy-cn"]) {
+    assert.equal(isRivalOptions({ name }, "any"), true, `应判定为对手: ${name}`);
+  }
+  // 只有 id、没有包名时（老版本 profile 里的行）也要认。
+  assert.equal(isRivalOptions({ id: "dsh-llm-workbuddy" }, "dsh-llm-workbuddy"), true);
+  // 本包自己算"重复副本"，由 includeOwn 决定是否计入。
+  assert.equal(isRivalOptions({ name: "@wangwei2k99/dsh-workbuddy" }, "x", true), true);
+  assert.equal(isRivalOptions({ name: "@wangwei2k99/dsh-workbuddy" }, "x", false), false);
+  // 分组行、空行、无关插件都不能被停用。
+  assert.equal(isRivalOptions({ group: true, name: "dsh-llm-workbuddy" }, "x"), false);
+  assert.equal(isRivalOptions(undefined, "x"), false);
+  assert.equal(isRivalOptions({ name: "@deepseek-ai/dsh-llm-deepseek" }, "llm-deepseek"), false);
+  assert.equal(isRivalOptions({ name: "dsh-pi-ai" }, "llm-pi-ai"), false);
+});
+
+test("停用对手行只在内存里改 disabled，并按 fiber 存活与否决定是否释放", () => {
+  const dead = { uid: null, state: 4, dispose() { throw new Error("不该释放已卸载的 fiber"); } };
+  const live = { uid: 7, state: 2, disposed: 0, dispose() { this.disposed += 1; this.uid = null; this.state = 4; } };
+  const rival = { options: { id: "dsh-llm-workbuddy", name: "dsh-llm-workbuddy" }, fiber: live };
+  const stale = { options: { id: "dsh-llm-codebuddy", name: "dsh-llm-codebuddy" }, fiber: dead };
+  const keep = { options: { id: "llm-pi-ai", name: "@deepseek-ai/dsh-llm-pi-ai" } };
+  const ctx = ctxWith(fakeLoader([rival, stale, keep]));
+
+  const outcome = __testing.clearRivals(ctx, { includeOwn: false }, { stop: true });
+  assert.equal(outcome.released, 1, "只有活着的那一个需要释放");
+  assert.equal(outcome.pending.length, 1, "释放动作要交回一个可等待的 Promise");
+  assert.equal(rival.options.disabled, true);
+  assert.equal(stale.options.disabled, true);
+  assert.equal(live.disposed, 1);
+  assert.equal(keep.options.disabled, undefined, "无关插件绝不能被停用");
+
+  // stop:false 只停用、不释放（用于"本插件已抢注成功"的收尾场景）。
+  const other = { options: { id: "dsh-llm-workbuddy", name: "dsh-llm-workbuddy" }, fiber: { uid: 9, state: 2, dispose() { this.hit = true; } } };
+  const quiet = __testing.clearRivals(ctxWith(fakeLoader([other])), { includeOwn: false }, { stop: false });
+  assert.equal(quiet.released, 0);
+  assert.deepEqual(quiet.pending, []);
+  assert.equal(other.options.disabled, true);
+  assert.equal(other.fiber.hit, undefined);
+});
+
+test("stopFiber 把异步卸载的完成时机交回调用方，且永不抛", () => {
+  const events = [];
+  const fiber = {
+    uid: 3,
+    state: 2,
+    dispose() {
+      // 复刻 cordis 的 _unload()：至少过几个微任务才真正删掉目录键。
+      return Promise.resolve()
+        .then(() => Promise.resolve())
+        .then(() => { events.push("disposed"); this.uid = null; this.state = 5; });
+    },
+  };
+  const task = __testing.stopFiber(fiber);
+  assert.equal(typeof task?.then, "function", "必须返回可等待的 Promise");
+  assert.deepEqual(events, [], "同步阶段还不能认为已经卸载完");
+  return task.then(() => {
+    assert.deepEqual(events, ["disposed"]);
+  });
+});
+
+test("stopFiber 对缺失/抛错/同步返回的 fiber 都返回已完成的 Promise", async () => {
+  assert.equal(__testing.stopFiber(undefined), undefined);
+  assert.equal(__testing.stopFiber({}), undefined);
+  await __testing.stopFiber({ uid: 1, state: 2, dispose() { throw new Error("boom"); } });
+  await __testing.stopFiber({ uid: 1, state: 2, dispose() { /* 同步完成 */ } });
+});
+
+test("stopRival 永不抛错，没有对手时返回空结果", () => {
+  const empty = __testing.stopRival(ctxWith(fakeLoader([])), { includeOwn: false });
+  assert.equal(empty.released, 0);
+  assert.deepEqual(empty.pending, []);
+
+  // ctx 完全没有 loader 能力时也不能炸。
+  assert.deepEqual(__testing.stopRival({}, { includeOwn: false }).pending, []);
+  assert.deepEqual(__testing.stopRival(undefined, undefined).pending, []);
+});
+
+test("rivalLlm 只把启用中的对手算作竞争，停用后立刻消失", () => {
+  const rival = { options: { id: "dsh-llm-workbuddy", name: "dsh-llm-workbuddy" }, fiber: { uid: 2, state: 2 } };
+  const ctx = ctxWith(fakeLoader([rival]));
+  const mine = { includeOwn: false };
+  assert.equal(__testing.rivalLlm(ctx, mine), true);
+  __testing.clearRivals(ctx, mine, { stop: false });
+  assert.equal(__testing.rivalLlm(ctx, mine), false, "停用后不应再被判为竞争");
+});
+
+test("同一进程内第二个本包副本认输，但仍会停用并释放对手", () => {
+  const owner = { uid: 11, state: 2 };
+  const rival = { options: { id: "dsh-llm-workbuddy", name: "dsh-llm-workbuddy" }, fiber: { uid: 12, state: 2 } };
+  const loader = fakeLoader([rival]);
+
+  // 第一次调用：抢占所有权（elected 在模块层，等价于进程级）。
+  const first = __testing.electWorkBuddy(ctxWith(loader), { fiber: owner, includeOwn: false });
+  assert.equal(first.won, true);
+
+  // 同一个 fiber 再来一次仍然算赢（自激不会导致自己认输）。
+  assert.equal(__testing.electWorkBuddy(ctxWith(loader), { fiber: owner, includeOwn: false }).won, true);
+
+  // 另一个活着的副本必须认输。
+  const second = __testing.electWorkBuddy(ctxWith(loader), { fiber: { uid: 13, state: 2 }, includeOwn: false });
+  assert.equal(second.won, false);
+  assert.equal(second.reason, "live-owner");
+
+  // 原主已经卸载（uid=null）时，新来的副本可以接管。
+  owner.uid = null;
+  assert.equal(__testing.electWorkBuddy(ctxWith(loader), { fiber: { uid: 14, state: 2 }, includeOwn: false }).won, true);
+});
+
+test("duplicateOf 认出 DUPLICATE_* 与各版本措辞，不误判无关错误", () => {
+  const { duplicateOf } = __testing;
+  assert.equal(duplicateOf({ code: "DUPLICATE_DIRECTORY" }), true);
+  assert.equal(duplicateOf({ code: "DUPLICATE_ADAPTER" }), true);
+  assert.equal(duplicateOf({ code: "DUPLICATE_DISCOVERY" }), true);
+  assert.equal(duplicateOf({ message: 'configurable provider "workbuddy-cn" is already declared' }), true);
+  assert.equal(duplicateOf({ message: "an adapter for provider workbuddy-cn is already registered" }), true);
+  assert.equal(duplicateOf({ code: "INVALID_DIRECTORY", message: "provider is invalid" }), false);
+  assert.equal(duplicateOf({ message: "network unreachable" }), false);
+  assert.equal(duplicateOf(null), false);
+});
+
+test("回收超时常量与重试次数保持在可接受的启动预算内", () => {
+  assert.ok(__testing.RECLAIM_TIMEOUT_MS > 0 && __testing.RECLAIM_TIMEOUT_MS <= 10_000);
+  assert.ok(__testing.RECLAIM_ATTEMPTS >= 1 && __testing.RECLAIM_ATTEMPTS <= 5);
+});
+
