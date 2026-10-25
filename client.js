@@ -67,26 +67,28 @@ window.__ModuleLoader__.load({
     const KEY_ACTION_WIDTH = 108;
 
     /**
-     * 下拉框统一样式：隐藏原生箭头，改用固定颜色的 SVG 箭头。
+     * 下拉框统一样式：对齐 DSH 官方 composer 触发器。
      *
-     * 原生箭头颜色继承 select 的 color，而 API Key 下拉会按可用性染成绿/红，
-     * 会让箭头跟着变色（语义混乱）。自定义箭头固定为中灰，且在深浅主题下都能辨认，
-     * 同时通过 paddingRight 预留空间、backgroundPosition 与右边缘保持 10px 间距。
+     * 规格取自 app.asar 内 dsh-client-ui-model-selection 的 .trigger 规则：
+     * 透明底、无边框、label-secondary 文字、小号灰箭头。
+     * 原生箭头颜色继承 color（API Key 下拉会按可用性染色），故改用固定 SVG。
      */
     const SELECT_ARROW_STYLE = Object.freeze({
       appearance: "none",
       WebkitAppearance: "none",
       MozAppearance: "none",
-      paddingRight: "34px",
+      border: "none",
+      backgroundColor: "transparent",
+      paddingRight: "26px",
       backgroundImage:
         `url("data:image/svg+xml;utf8,${encodeURIComponent(
-          '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">'
-          + '<path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="#9aa4b2" stroke-width="1.7" '
+          '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10">'
+          + '<path d="M2 3.75 5 6.75l3-3" fill="none" stroke="#8b95a5" stroke-width="1.4" '
           + 'stroke-linecap="round" stroke-linejoin="round"/></svg>',
         )}")`,
       backgroundRepeat: "no-repeat",
-      backgroundPosition: "right 10px center",
-      backgroundSize: "12px 12px",
+      backgroundPosition: "right 8px center",
+      backgroundSize: "10px 10px",
     });
 
     /**
@@ -149,6 +151,139 @@ window.__ModuleLoader__.load({
 [data-wb-ui] .wb-card:hover {
   border-color: var(--dsw-alias-border-l2, rgba(128,128,128,.45));
   box-shadow: 0 1px 2px rgba(0,0,0,.05);
+}
+/*
+ * 原生下拉列表的配色。
+ *
+ * Chromium 里 option 的弹层默认跟随系统主题（浅色），在深色界面中会变成
+ * 白底 + 浅蓝高亮，与 DSH 原生控件割裂。option 只接受 color / background-color，
+ * 这两条即可让弹层跟随 DSH 主题变量。
+ */
+[data-wb-ui] option,
+[data-workbuddy-context-window] option {
+  background-color: var(--dsw-alias-bg-overlay, #2b2b2b);
+  color: var(--dsw-alias-label-primary, #e6e6e6);
+}
+/* 选中项在部分平台由系统绘制，显式给 checked 项留出可辨识的底色。 */
+[data-wb-ui] option:checked,
+[data-workbuddy-context-window] option:checked {
+  background-color: var(--dsw-alias-brand-primary, #4f8ff7);
+  color: #fff;
+}
+/*
+ * 上下文窗口控件：规格取自 app.asar 内 dsh-client-ui-conversation 的
+ * InputBar module css 的 select 规则——即 composer 工具栏原生下拉的真实样式：
+ *   border-radius: var(--dsw-radius-sm)  height: 28px  max-width: 220px
+ *   color: label-secondary  background-color: #0000  border: none
+ *   padding: 0 20px 0 8px  font-size: 13px  font-weight: 500  line-height: 20px
+ *   箭头：12px SVG，right 4px center，描边色 #81858C
+ * 菜单面板与选项沿用 PermissionSelect 的 menu / option 规格。
+ */
+[data-workbuddy-context-window] .wb-cw-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 4px 0 8px;
+  border: none;
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: 0 0;
+  color: var(--dsw-alias-label-secondary, currentColor);
+  /* button 默认不继承字体，必须显式声明，否则与相邻控件字号/字族不一致。 */
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  cursor: pointer;
+  outline: none;
+  transition: background-color .12s;
+}
+[data-workbuddy-context-window] .wb-cw-trigger:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08));
+}
+[data-workbuddy-context-window] .wb-cw-trigger:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #4f8ff7));
+}
+[data-workbuddy-context-window] .wb-cw-trigger:disabled {
+  color: var(--dsw-alias-label-dimmed, currentColor);
+  cursor: default;
+  opacity: .6;
+}
+[data-workbuddy-context-window] .wb-cw-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+[data-workbuddy-context-window] .wb-cw-chevron {
+  display: inline-flex;
+  flex: none;
+  color: var(--dsw-alias-label-caption, currentColor);
+  transition: transform .12s;
+}
+[data-workbuddy-context-window] .wb-cw-chevron.is-open {
+  transform: rotate(180deg);
+}
+[data-workbuddy-context-window] .wb-cw-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  min-width: 120px;
+  max-width: min(240px, calc(100vw - 32px));
+  max-height: min(360px, calc(100vh - 96px));
+  padding: 4px;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--dsw-radius-md, 12px);
+  background: var(--dsw-alias-bg-overlay, #2b2b2b);
+  box-shadow: var(--dsw-elevation-prominent, 0 8px 24px rgba(0,0,0,.35));
+  color: var(--dsw-alias-label-primary, #e6e6e6);
+}
+[data-workbuddy-context-window] .wb-cw-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  width: auto;
+  min-width: 100%;
+  min-height: 34px;
+  padding: 5px 7px;
+  border: none;
+  border-radius: var(--dsw-radius-md, 12px);
+  background: 0 0;
+  color: inherit;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+  outline: none;
+}
+[data-workbuddy-context-window] .wb-cw-option:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08));
+}
+[data-workbuddy-context-window] .wb-cw-option:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #4f8ff7));
+}
+[data-workbuddy-context-window] .wb-cw-option-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: auto;
+}
+[data-workbuddy-context-window] .wb-cw-check {
+  display: grid;
+  flex: 0 0 14px;
+  place-items: center;
+  color: var(--dsw-alias-label-primary, #e6e6e6);
 }
 @media (prefers-reduced-motion: reduce) {
   [data-wb-ui] * { transition: none !important; animation: none !important; }
@@ -574,13 +709,16 @@ window.__ModuleLoader__.load({
     function mountPendingSelector() {
       if (typeof document === "undefined") return;
       const seats = Array.from(document.querySelectorAll("[data-composer-seat]"));
+      // 先判 seat 再查 panel：非 hero 相位占多数，此时不应为查找面板而再扫一遍文档。
       const seat = seats.find((candidate) => candidate.closest('[data-phase="hero"]'));
-      const panels = Array.from(document.querySelectorAll(`[${PENDING_MARKER}]`));
       if (!seat) {
-        for (const panel of panels) panel.remove();
+        // 仅在确实存在残留面板时才做清理扫描。
+        if (document.querySelector(`[${PENDING_MARKER}]`)) {
+          for (const panel of document.querySelectorAll(`[${PENDING_MARKER}]`)) panel.remove();
+        }
         return;
       }
-      for (const panel of panels) {
+      for (const panel of seat.querySelectorAll(`[${PENDING_MARKER}]`)) {
         if (panel.parentElement !== seat) panel.remove();
       }
       const panel = seat.querySelector(`[${PENDING_MARKER}]`) ?? createPendingSelector();
@@ -616,18 +754,23 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         let disposed = false;
         let requestId = 0;
-        const load = async () => {
+        // 轮询与首次加载要区别对待：首次加载可以显示「读取中」，
+        // 但每分钟一次的刷新若也置为 loading，界面会周期性闪一下，
+        // 且丢弃已显示的数据。这里用 silent 标记静默刷新。
+        const load = async (silent = false) => {
           const currentRequestId = ++requestId;
           if (!selected) {
             setState(null);
             return;
           }
-          setState({ mode: "token", creditLoading: true, credits: undefined, todayUsage: null, creditError: null, todayUsageError: null });
+          if (!silent) {
+            setState({ mode: "token", creditLoading: true, credits: undefined, todayUsage: null, creditError: null, todayUsageError: null });
+          }
           let status;
           try {
             status = await authRequest("status", undefined, sessionId);
           } catch {
-            if (!disposed && currentRequestId === requestId) setState(null);
+            if (!disposed && currentRequestId === requestId && !silent) setState(null);
             return;
           }
           if (disposed || currentRequestId !== requestId) return;
@@ -653,9 +796,12 @@ window.__ModuleLoader__.load({
           }
         };
         load();
+        // 认证状态切换说明凭证真的变了，需要重新展示「读取中」。
         const onAuthState = () => load();
         window.addEventListener(AUTH_STATE_EVENT, onAuthState);
-        const timer = window.setInterval(load, 60_000);
+        // 注意不能直接把 load 交给 setInterval：定时器会把当前时间作为
+        // 第一个实参传入，导致 silent 变成 truthy 而误判为静默刷新。
+        const timer = window.setInterval(() => load(true), 60_000);
         return () => {
           disposed = true;
           window.removeEventListener(AUTH_STATE_EVENT, onAuthState);
@@ -1470,20 +1616,21 @@ window.__ModuleLoader__.load({
         select.setAttribute("aria-label", ariaLabel);
         select.title = hint;
         Object.assign(select.style, {
-          minHeight: "36px",
+          // 高度与 composer 工具栏控件一致（约 28px），不再用表单输入的 36px。
+          minHeight: "28px",
           minWidth: "0",
+          height: "28px",
           boxSizing: "border-box",
-          padding: "0 10px",
-          border: "1px solid var(--dsw-alias-border-l1, currentColor)",
-          borderRadius: "8px",
-          // 用 backgroundColor 而非 background 简写，否则会清掉下面设置的箭头图。
-          backgroundColor: "var(--dsw-alias-bg-layer-2, transparent)",
-          color: "var(--dsw-alias-label-primary, currentColor)",
+          padding: "0 6px",
+          borderRadius: "6px",
+          // 无边框、透明底，靠 SELECT_ARROW_STYLE 统一（见其注释）。
+          color: "var(--dsw-alias-label-secondary, currentColor)",
           font: "inherit",
-          fontSize: "13px",
-          transition: "border-color 140ms ease, box-shadow 140ms ease",
+          fontSize: "12px",
+          cursor: "pointer",
+          transition: "background-color 140ms ease",
         });
-        // 与 API Key 下拉同一套箭头样式。
+        // 与 API Key 下拉同一套箭头样式（会覆盖 border/background 为透明）。
         Object.assign(select.style, SELECT_ARROW_STYLE);
         const raw = model[key];
         const current = Number.isFinite(raw) && raw > 0 ? raw : fallback;
@@ -1848,11 +1995,39 @@ window.__ModuleLoader__.load({
         : null;
     }
 
+    /**
+     * 一次页面扫描：给目标输入框挂载组件，并在 hero 相位补上待启用选择器。
+     *
+     * 只用一次 querySelectorAll 同时判定两个目标是否存在，避免调用方
+     * 为每个目标各扫一遍文档。
+     */
     function enhance() {
-      for (const input of document.querySelectorAll('input[aria-label="API 密钥"]')) {
+      if (typeof document === "undefined") return;
+      const apiKeyInputs = document.querySelectorAll('input[aria-label="API 密钥"]');
+      for (const input of apiKeyInputs) {
         if (isWorkBuddy(input)) mount(input);
       }
       mountPendingSelector();
+    }
+
+    /**
+     * 把 enhance 收敛到每帧最多执行一次。
+     *
+     * 原先 MutationObserver 直接以 enhance 为回调：流式输出时 DOM 每秒变动
+     * 数十次，而 enhance 内部是全文档 querySelectorAll —— 等于每个 token
+     * 都做一次全量扫描。改为 rAF 合帧后，一帧内的任意多次变更只扫描一次，
+     * 既保留挂载能力又把开销压到与刷新率同阶。
+     */
+    let enhanceFrame = 0;
+    function scheduleEnhance() {
+      if (enhanceFrame) return;
+      const raf = typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (callback) => setTimeout(callback, 16);
+      enhanceFrame = raf(() => {
+        enhanceFrame = 0;
+        enhance();
+      });
     }
 
     const SNAP_RATIO = 0.05;
@@ -1893,6 +2068,11 @@ window.__ModuleLoader__.load({
       const [value, setValue] = useState(null);
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState(null);
+      // 菜单开合状态必须与上面几个 hook 一起声明在 early return 之前：
+      // React 要求每次渲染的 hook 调用顺序一致，放到 return null 之后会在
+      // 缺少会话/模型时直接崩掉整个组件（表现为控件消失）。
+      const [open, setOpen] = useState(false);
+      const rootRef = useRef(null);
 
       useEffect(() => {
         let disposed = false;
@@ -1908,6 +2088,23 @@ window.__ModuleLoader__.load({
           });
         return () => { disposed = true; };
       }, [selected, modelId]);
+
+      // 菜单打开时监听外部点击与 Esc 关闭。
+      useEffect(() => {
+        if (!open) return undefined;
+        const onPointerDown = (event) => {
+          if (!rootRef.current?.contains(event.target)) setOpen(false);
+        };
+        const onKeyDown = (event) => {
+          if (event.key === "Escape") setOpen(false);
+        };
+        document.addEventListener("pointerdown", onPointerDown);
+        document.addEventListener("keydown", onKeyDown);
+        return () => {
+          document.removeEventListener("pointerdown", onPointerDown);
+          document.removeEventListener("keydown", onKeyDown);
+        };
+      }, [open]);
 
       if (!selected || !modelId || value === null) return null;
 
@@ -1933,51 +2130,90 @@ window.__ModuleLoader__.load({
       const options = snapped !== null
         ? CONTEXT_WINDOW_OPTIONS
         : [...CONTEXT_WINDOW_OPTIONS, { value, label: exactContextWindow(value), hint: "当前自定义值" }];
+      const current = options.find((option) => option.value === displayValue) ?? options[0];
+
+      // 结构照抄 DSH 官方 PermissionSelect：trigger 按钮 + 向上弹出的 Menu。
+      // 官方用 ui-primitives 的 Menu 组件，但那是 shell 内部模块、插件无法 require，
+      // 因此这里用同样的 DOM/CSS 自行实现弹出层，视觉与交互保持一致。
+      const choose = (next) => {
+        setOpen(false);
+        if (next === displayValue) return;
+        void apply(next);
+      };
 
       return createElement("div", {
+        key: "context-window",
+        ref: rootRef,
         "data-workbuddy-context-window": true,
         role: "group",
         "aria-label": "WorkBuddy 上下文窗口",
         title: error ?? "选择上下文窗口：窗口越大，每轮消耗的积分越多",
         style: {
+          position: "relative",
           display: "inline-flex",
           alignItems: "center",
-          gap: "6px",
           minWidth: 0,
         },
       }, [
-        createElement("span", {
-          key: "label",
-          style: {
-            fontSize: "12px",
-            color: "var(--dsw-alias-label-secondary, currentColor)",
-            whiteSpace: "nowrap",
-          },
-        }, "上下文"),
-        createElement("select", {
-          key: "select",
-          value: String(displayValue),
+        createElement("button", {
+          key: "trigger",
+          type: "button",
+          className: "wb-cw-trigger",
+          "aria-haspopup": "menu",
+          "aria-expanded": open,
+          "aria-label": `上下文窗口：${current.label}`,
           disabled: busy,
+          style: error
+            ? { color: "var(--dsw-alias-state-error-primary, #f25a5a)" }
+            : undefined,
+          onClick: () => setOpen(!open),
+        }, [
+          createElement("span", { key: "label", className: "wb-cw-label" }, current.label),
+          createElement("span", {
+            key: "chevron",
+            className: open ? "wb-cw-chevron is-open" : "wb-cw-chevron",
+            "aria-hidden": true,
+          }, createElement("svg", {
+            width: 12, height: 12, viewBox: "0 0 12 12", focusable: "false",
+          }, createElement("path", {
+            d: "M2.5 4.5 6 8l3.5-3.5",
+            fill: "none",
+            stroke: "currentColor",
+            strokeWidth: 1.5,
+            strokeLinecap: "round",
+            strokeLinejoin: "round",
+          }))),
+        ]),
+        open && createElement("div", {
+          key: "menu",
+          className: "wb-cw-menu",
+          role: "menu",
           "aria-label": "上下文窗口档位",
-          onChange: (event) => void apply(Number(event.target.value)),
-          style: {
-            minHeight: "28px",
-            padding: "0 6px",
-            borderRadius: "6px",
-            border: error
-              ? "1px solid var(--dsw-alias-state-error-primary, #e5534b)"
-              : "1px solid var(--dsw-alias-border-l1, currentColor)",
-            background: "var(--dsw-alias-bg-layer-1, transparent)",
-            color: "var(--dsw-alias-label-primary, currentColor)",
-            font: "inherit",
-            fontSize: "12px",
-            cursor: busy ? "progress" : "pointer",
-          },
-        }, options.map((option) => createElement("option", {
+        }, options.map((option) => createElement("button", {
           key: String(option.value),
-          value: String(option.value),
+          type: "button",
+          role: "menuitemradio",
+          "aria-checked": option.value === displayValue,
+          className: option.value === displayValue ? "wb-cw-option is-selected" : "wb-cw-option",
           title: option.hint,
-        }, option.label))),
+          onClick: () => choose(option.value),
+        }, [
+          createElement("span", { key: "text", className: "wb-cw-option-text" }, option.label),
+          option.value === displayValue && createElement("span", {
+            key: "check",
+            className: "wb-cw-check",
+            "aria-hidden": true,
+          }, createElement("svg", {
+            width: 14, height: 14, viewBox: "0 0 14 14", focusable: "false",
+          }, createElement("path", {
+            d: "M2.5 7.5 5.5 10.5 11.5 4",
+            fill: "none",
+            stroke: "currentColor",
+            strokeWidth: 1.6,
+            strokeLinecap: "round",
+            strokeLinejoin: "round",
+          }))),
+        ]))),
       ]);
     }
 
@@ -2005,13 +2241,21 @@ window.__ModuleLoader__.load({
         label: "WorkBuddy 上下文窗口",
       }, WorkBuddyContextWindowControl));
       ctx.effect(() => {
-        const observer = new MutationObserver(enhance);
+        // 观察器只负责“通知有变化”，真正的扫描由 scheduleEnhance 合帧执行。
+        const observer = new MutationObserver(scheduleEnhance);
         observer.observe(document.body, { childList: true, subtree: true });
-        document.addEventListener("change", enhance, true);
+        document.addEventListener("change", scheduleEnhance, true);
         enhance();
         return () => {
           observer.disconnect();
-          document.removeEventListener("change", enhance, true);
+          document.removeEventListener("change", scheduleEnhance, true);
+          if (enhanceFrame) {
+            const cancel = typeof cancelAnimationFrame === "function"
+              ? cancelAnimationFrame
+              : clearTimeout;
+            cancel(enhanceFrame);
+            enhanceFrame = 0;
+          }
         };
       }, "llm-workbuddy: auth switch");
     }

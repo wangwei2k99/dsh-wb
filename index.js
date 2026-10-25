@@ -131,9 +131,21 @@ function estimateTextTokens(text) {
   if (typeof text !== "string" || text.length === 0) return 0;
   let wide = 0;
   let narrow = 0;
-  for (const char of text) {
-    if (char.codePointAt(0) >= 0x2e80) wide += 1;
-    else narrow += 1;
+  // 用码元遍历（charCodeAt）代替 for-of：for-of 每字符都要走迭代器协议
+  // 并按 code point 解码，长上下文下开销明显；这里只在遇到代理对时
+  // 额外跳过一个码元，语义与原实现一致。
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0x2e80) {
+      wide += 1;
+      // 高位代理：与紧随的低位代理同属一个 code point，一并跳过。
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(index + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) index += 1;
+      }
+    } else {
+      narrow += 1;
+    }
   }
   return wide + Math.ceil(narrow / 4);
 }
@@ -229,7 +241,11 @@ async function normalizeWorkBuddyError(response, trace) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 16_384) return response;
+      if (size > 16_384) {
+        // 超限说明不是我们要识别的短 JSON 错误体，直接放弃；
+        // reader 的释放统一由下方 finally 负责。
+        return response;
+      }
       chunks.push(value);
     }
     const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -296,16 +312,26 @@ function workBuddyRequestOptions(options) {
     })
     : undefined;
   const identityOptions = { identityHeaders };
+  // 身份头只计算一次：它由「静态 profile + 动态会话头」合并而成，
+  // 同一请求内两者都不变，无需在每次 fetch 时重建（new Headers + Object.fromEntries
+  // 都是逐条遍历，流式请求里每个回合都会走一遍）。
+  const baseHeaders = codeBuddyHeaders(options?.headers, identity, identityOptions);
   return {
     ...options,
     timeoutMs: options?.timeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
-    headers: codeBuddyHeaders(options?.headers, identity, identityOptions),
+    headers: baseHeaders,
     fetch: async (input, init) => {
       const started = Date.now();
       traceEvent(trace, "http.start");
       try {
         const prepared = sanitizeWorkBuddyRequest(init, identity);
-        const response = await fetchImpl(input, { ...prepared, headers: codeBuddyHeaders(prepared?.headers ?? options?.headers, identity, identityOptions) });
+        // sanitize 只改 body，会原样保留 init.headers。因此只要调用方没在
+        // init 里另带头（或带的就是进 options 的那份），身份头结果就是同一个。
+        const callerHeaders = prepared?.headers;
+        const merged = callerHeaders === undefined || callerHeaders === options?.headers
+          ? baseHeaders
+          : codeBuddyHeaders(callerHeaders, identity, identityOptions);
+        const response = await fetchImpl(input, { ...prepared, headers: merged });
         traceEvent(trace, "http.headers", { elapsedMs: Date.now() - started, status: response.status });
         return await normalizeWorkBuddyError(response, trace);
       } catch (error) {
@@ -819,7 +845,7 @@ function installSettingsCompat(ctx, ns, schema, entry, hooks) {
   });
 }
 
-export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, providerSettings, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor, estimateContextTokens, boundContextBudget, silentContextOverflow, workBuddyApi });
+export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, providerSettings, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor, estimateTextTokens, estimateContextTokens, boundContextBudget, silentContextOverflow, workBuddyApi });
 
 export function apply(ctx, config) {
   const modernSettings = typeof config?.providers?.get === "function";

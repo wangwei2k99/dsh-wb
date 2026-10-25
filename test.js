@@ -407,7 +407,11 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   assert.match(client, /const hasTokenAccount = state\?\.mode === "token"/);
   assert.match(client, /state\.routingEnabled && sessionId \? createElement/);
   assert.match(client, /const seats = Array\.from\(document\.querySelectorAll\("\[data-composer-seat\]"\)\)/);
-  assert.match(client, /for \(const panel of panels\) panel\.remove\(\)/);
+  // 非 hero 相位只清理残留面板，不应额外做一次全文档扫描。
+  assert.ok(client.includes("if (document.querySelector(`[${PENDING_MARKER}]`))"));
+  // enhance 必须经 rAF 合帧，避免流式输出时每个 token 都全量扫描 DOM。
+  assert.match(client, /function scheduleEnhance\(\)/);
+  assert.match(client, /new MutationObserver\(scheduleEnhance\)/);
   assert.match(client, /ctx\.slots\.inject\("plugins\.detail\.section"/);
   assert.match(client, /subject\?\.kind === "bundle" && BUNDLE_NAMES\.has\(subject\.pkg\?\.name\)/);
   assert.match(index, /const legacyAdapter = typeof adapter\.prepareCall !== "function"/);
@@ -1047,4 +1051,157 @@ test("积分查询只接受受信任的 WorkBuddy billing 域名", () => {
     PackageEndTimeRangeBegin: "2026-08-31 09:08:07",
     PackageEndTimeRangeEnd: "2127-08-31 09:08:07",
   });
+});
+
+test("客户端 bundle 可加载且 apply 能注册全部槽位", async () => {
+  // 客户端 bundle 通过 window.__ModuleLoader__ 注册，运行时由浏览器提供。
+  // 这里用最小 stub 复现该契约，确保：
+  //   1) 模块顶层代码（含 ensureStyles 的模板字符串）不抛错
+  //   2) apply(ctx) 能注册所有槽位
+  // 曾出现过的真实故障：CSS 注释里写了反引号，把模板字符串提前截断，
+  // 导致 ensureStyles 抛 TypeError、整个插件加载失败（UI 显示 failed）。
+  const captured = {};
+  const stubReact = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+    useEffect: () => {},
+    useRef: (value) => ({ current: value }),
+    Fragment: "Fragment",
+  };
+  const makeNode = () => ({
+    style: {}, dataset: {}, textContent: "",
+    setAttribute() {}, append() {}, appendChild() {},
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+  });
+
+  const saved = {
+    window: globalThis.window,
+    document: globalThis.document,
+    mutationObserver: globalThis.MutationObserver,
+    event: globalThis.Event,
+  };
+  globalThis.window = {
+    __ModuleLoader__: { load: (definition) => Object.assign(captured, definition) },
+    addEventListener() {}, removeEventListener() {}, dispatchEvent() {},
+  };
+  globalThis.document = {
+    ...makeNode(),
+    createElement: makeNode,
+    getElementById: () => null,
+    head: makeNode(),
+    body: makeNode(),
+  };
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  globalThis.Event = class { constructor(type) { this.type = type; } };
+
+  try {
+    const { registerHooks } = await import("node:module").catch(() => ({}));
+    void registerHooks;
+
+    // client.js 是 CommonJS 风格（require("react")），用动态 import 会走 ESM 解析，
+    // 这里改用 createRequire 以保持与 DSH 运行时一致的加载路径。
+    const { createRequire } = await import("node:module");
+    const requireClient = createRequire(import.meta.url);
+    const reactPath = requireClient.resolve("react");
+    requireClient.cache[reactPath] = {
+      id: reactPath, filename: reactPath, loaded: true, exports: stubReact,
+    };
+
+    // 清掉可能的残留缓存后加载
+    const clientPath = requireClient.resolve("./client.js");
+    delete requireClient.cache[clientPath];
+    requireClient(clientPath);
+
+    assert.equal(captured.id, "@wangwei2k99/dsh-workbuddy", "模块应以包名注册");
+    assert.equal(typeof captured.factory, "function", "factory 应为函数");
+
+    const client = captured.factory((name) => {
+      if (name === "react") return stubReact;
+      throw new Error(`unexpected require: ${name}`);
+    });
+    assert.equal(typeof client.apply, "function");
+
+    const registered = [];
+    const ctx = {
+      slots: {
+        inject(_key, callback) { callback(); },
+        register(meta, component) {
+          registered.push({ id: meta.id ?? meta.key, component });
+          return { dispose() {} };
+        },
+      },
+      effect(callback) { callback(); return () => {}; },
+      get: () => undefined,
+      on: () => () => {},
+    };
+    // 不能抛错：任何抛错都会让 DSH 标记整个插件 failed
+    client.apply(ctx);
+
+    const ids = registered.map((r) => r.id).sort();
+    assert.deepEqual(ids, [
+      "llm-workbuddy",
+      "llm-workbuddy",
+      "workbuddy-context-window",
+      "workbuddy-credits",
+    ]);
+    for (const entry of registered) {
+      assert.equal(typeof entry.component, "function", `${entry.id} 应为组件函数`);
+    }
+  } finally {
+    if (saved.window === undefined) delete globalThis.window;
+    else globalThis.window = saved.window;
+    if (saved.document === undefined) delete globalThis.document;
+    else globalThis.document = saved.document;
+    if (saved.mutationObserver === undefined) delete globalThis.MutationObserver;
+    else globalThis.MutationObserver = saved.mutationObserver;
+    if (saved.event === undefined) delete globalThis.Event;
+    else globalThis.Event = saved.event;
+  }
+});
+
+test("token 估算对代理对与全角字符的计数与逐 code point 遍历一致", () => {
+  // estimateTextTokens 用 charCodeAt 遍历（比 for-of 快约 4 倍），
+  // 这里用逐 code point 的参考实现锁定语义，防止优化改坏计数。
+  function reference(text) {
+    if (typeof text !== "string" || text.length === 0) return 0;
+    let wide = 0;
+    let narrow = 0;
+    for (const char of text) {
+      if (char.codePointAt(0) >= 0x2e80) wide += 1;
+      else narrow += 1;
+    }
+    return wide + Math.ceil(narrow / 4);
+  }
+
+  const cases = [
+    "", "abc", "你好世界", "hello 世界", "😀😀", "a😀b",
+    "\u2e80\u2e80", "\u2e7f", "\uFF00\uFF01", "ｆｕｌｌ",
+    "x".repeat(100), "中".repeat(50),
+    "日本語のテキスト", "한국어 텍스트",
+    "\uD840\uDC00", "\uD800", "\uDC00", "\uD800\uD800\uDC00",
+    "\uDBFF\uDFFF", "混合 mixed テキスト 😀 \u2e80",
+  ];
+  for (const text of cases) {
+    assert.equal(
+      __testing.estimateTextTokens(text),
+      reference(text),
+      `估算结果与参考实现不一致: ${JSON.stringify(text)}`,
+    );
+  }
+
+  // 随机组合覆盖代理对边界。
+  const pool = ["a", "Z", " ", "中", "あ", "한", "😀", "\u2e80", "\u2e7f", "\uD800", "\uDC00", "ｆ", "\uFF01"];
+  for (let round = 0; round < 500; round += 1) {
+    let sample = "";
+    const length = Math.floor(Math.random() * 10);
+    for (let index = 0; index < length; index += 1) {
+      sample += pool[Math.floor(Math.random() * pool.length)];
+    }
+    assert.equal(
+      __testing.estimateTextTokens(sample),
+      reference(sample),
+      `随机样本估算不一致: ${JSON.stringify(sample)}`,
+    );
+  }
 });

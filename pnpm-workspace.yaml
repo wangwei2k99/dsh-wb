@@ -1,0 +1,9 @@
+# pnpm 构建脚本白名单。
+#
+# 本插件只走 OpenAI 兼容协议（openai-completions），不使用 Google Gemini
+# 与 protobuf 相关能力，因此这两个依赖的安装脚本无需执行。
+# 显式设为 false 而不是留空，避免 pnpm 每次安装都以
+# ERR_PNPM_IGNORED_BUILDS 失败退出。
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false

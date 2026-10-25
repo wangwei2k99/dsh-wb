@@ -5,3 +5,7 @@ node_modules/
 Thumbs.db
 *.log
 .workbuddy/
+# 本仓库统一用 pnpm 管理依赖，锁文件只保留 pnpm-lock.yaml。
+# 忽略 npm/yarn 的锁文件，避免两套锁文件出现不一致。
+package-lock.json
+yarn.lock
