@@ -1,0 +1,10 @@
+- id: llm-pi-ai
+  disabled: !!js >-
+    !ctx.get('profileContext')?.installAnchor ||
+    Number(JSON.parse(process.getBuiltinModule('fs').readFileSync(
+    ctx.get('profileContext').installAnchor, 'utf8')).version
+    .match(/^0\.1\.(\d+)/)?.[1] ?? 7) < 7
+
+- insert:
+    - id: llm-workbuddy
+      name: '@wangwei2k99/dsh-workbuddy'

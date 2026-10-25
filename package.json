@@ -1,0 +1,93 @@
+{
+  "name": "@wangwei2k99/dsh-workbuddy",
+  "version": "0.2.1-rc.4",
+  "description": "通过 WorkBuddy API Key 或 WorkBuddy 登录令牌为 DeepSeek Harness 接入 WorkBuddy 模型",
+  "author": "WangWei2k99",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "workbuddy",
+    "llm",
+    "provider"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*": "./locale/*"
+  },
+  "bin": {
+    "dsh-llm-workbuddy": "cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wangwei2k99/dsh-workbuddy.git"
+  },
+  "homepage": "https://github.com/wangwei2k99/dsh-workbuddy#readme",
+  "bugs": {
+    "url": "https://github.com/wangwei2k99/dsh-workbuddy/issues"
+  },
+  "files": [
+    "index.js",
+    "workbuddy-discovery.js",
+    "workbuddy-auth.js",
+    "workbuddy-credits.js",
+    "workbuddy-web.js",
+    "client.js",
+    "cli.js",
+    "cordis.patch.yml",
+    "probe_context_limit.py",
+    "locale/zh.json",
+    "locale/en.json",
+    "docs/反向代理调用WorkBuddy-API开发文档.md",
+    "docs/2026-10-21-codebuddy-channel-analysis.md",
+    "docs/模型上下文档位实测与建议.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check workbuddy-discovery.js && node --check workbuddy-auth.js && node --check workbuddy-credits.js && node --check workbuddy-web.js && node --check client.js && node --check cli.js && node --test test.js && node cli.js --self-test"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.2-alpha.2 <0.2.0 || >=0.1.5-rc.3 <0.1.5 || >=0.1.7-rc.1 <0.1.7 || >=0.2.0-0 <0.3.0-0"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.1-rc.3": "compatible"
+      }
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.87.1",
+    "pnpm": "11.19.0",
+    "yaml": "2.9.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-credentials": ">=0.1.2-alpha.2 <0.2.0 || >=0.1.5-rc.3 <0.1.5 || >=0.1.7-rc.1 <0.1.7 || >=0.2.0-0 <0.3.0-0",
+    "@deepseek-ai/dsh-launch-environment": ">=0.1.2-alpha.2 <0.2.0 || >=0.1.5-rc.3 <0.1.5 || >=0.1.7-rc.1 <0.1.7 || >=0.2.0-0 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-alpha.2 <0.2.0 || >=0.1.5-rc.3 <0.1.5 || >=0.1.7-rc.1 <0.1.7 || >=0.2.0-0 <0.3.0-0",
+    "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.2-alpha.2 <0.2.0 || >=0.1.5-rc.3 <0.1.5 || >=0.1.7-rc.1 <0.1.7 || >=0.2.0-0 <0.3.0-0",
+    "@deepseek-ai/dsh-settings": ">=0.1.2-alpha.2 <0.2.0 || >=0.1.5-rc.3 <0.1.5 || >=0.1.7-rc.1 <0.1.7 || >=0.2.0-0 <0.3.0-0",
+    "react": "^18.2.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}

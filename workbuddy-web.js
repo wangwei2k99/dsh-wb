@@ -1,0 +1,784 @@
+import { randomBytes } from "node:crypto";
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import {
+  WORKBUDDY_API_KEYS_REF,
+  WORKBUDDY_SESSION_REF,
+  WORKBUDDY_SESSIONS_REF,
+  WORKBUDDY_SESSION_ROUTING_REF,
+  LEGACY_API_KEYS_REF,
+  LEGACY_SESSION_REF,
+  LEGACY_SESSIONS_REF,
+  activeWorkBuddySession,
+  workBuddyApiKeyEntries,
+  workBuddySessionAccounts,
+  createWorkBuddyApiKeyStore,
+  createWorkBuddySessionStore,
+  createWorkBuddySessionRoutingState,
+  parseWorkBuddyApiKeys,
+  loginWorkBuddy,
+  parseWorkBuddySession,
+  parseWorkBuddySessions,
+  refreshWorkBuddySession,
+  serializeWorkBuddyApiKeys,
+  serializeWorkBuddySession,
+  serializeWorkBuddySessions,
+  serializeWorkBuddySessionRouting,
+  parseWorkBuddySessionRouting,
+  sessionNeedsRefresh,
+  upsertWorkBuddyApiKey,
+  upsertWorkBuddySession,
+} from "./workbuddy-auth.js";
+import { fetchWorkBuddyCredits } from "./workbuddy-credits.js";
+
+const PROVIDER = "workbuddy-cn";
+const LEGACY_PROVIDER = "codebuddy-cn";
+const API_KEY_ENV = "WORKBUDDY_API_KEY";
+const LEGACY_API_KEY_ENV = "CODEBUDDY_API_KEY";
+const ROUTE = "/dsh-llm-workbuddy/auth";
+const ENV_SOURCES = new Set(["env", "user-env", "project-env"]);
+
+/** 上下文窗口上限：超过此值的写入请求会被拒绝。 */
+const MAX_CONTEXT_WINDOW = 1000000;
+
+/** 各模型的默认上下文窗口，仅在没有显式配置时使用。 */
+const DEFAULT_CONTEXT_WINDOWS = Object.freeze({
+  "deepseek-v4.1-flash": 1000000,
+  "kimi-k3.1-pro": 1000000,
+  "kimi-k3.1-pro-highspeed": 1000000,
+});
+
+export function authenticationMode(config) {
+  const profile = config?.providers?.[PROVIDER] ?? config?.providers?.[LEGACY_PROVIDER];
+  return profile && profile.apiKeyEnv === undefined ? "token" : "api-key";
+}
+
+function json(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+
+function localPost(req) {
+  const address = req.socket.remoteAddress;
+  const loopback = address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+  if (!loopback) return false;
+  const origin = req.headers.origin;
+  if (!origin) return req.headers["sec-fetch-site"] === "same-origin"
+    || /(?:^|\s)@deepseek-ai\/dsh-desktop\/\d/.test(req.headers["user-agent"] ?? "");
+  if (origin === "dsh-app://app") return true;
+  try {
+    return ["127.0.0.1", "localhost", "[::1]"].includes(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function requestBody(req) {
+  let raw = "";
+  for await (const chunk of req) {
+    raw += chunk.toString();
+    if (raw.length > 64 * 1024) throw new Error("请求体过大");
+  }
+  if (!raw.trim()) return {};
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    throw new Error("请求参数格式无效");
+  }
+}
+
+async function setMode(settings, mode, apiKeyRef = API_KEY_ENV) {
+  const config = settings.get("llm-pi-ai");
+  const providers = config?.providers ?? {};
+  const exists = Object.hasOwn(providers, PROVIDER);
+  const legacy = !exists && Object.hasOwn(providers, LEGACY_PROVIDER) ? providers[LEGACY_PROVIDER] : undefined;
+  const path = ["providers", PROVIDER];
+  if (!exists) {
+    const value = { ...(legacy ?? {}), ...(mode === "token" ? {} : { apiKeyEnv: apiKeyRef }) };
+    await settings.mutate("llm-pi-ai", [
+      { op: "set", path, value },
+      ...(legacy ? [{ op: "unset", path: ["providers", LEGACY_PROVIDER] }] : []),
+    ]);
+    return;
+  }
+  await settings.mutate("llm-pi-ai", [
+    {
+      op: mode === "token" ? "unset" : "set",
+      path: [...path, "apiKeyEnv"],
+      ...(mode === "api-key" ? { value: apiKeyRef } : {}),
+    },
+    ...(Object.hasOwn(providers, LEGACY_PROVIDER) ? [{ op: "unset", path: ["providers", LEGACY_PROVIDER] }] : []),
+  ]);
+}
+
+function configuredApiKeyRef(settings) {
+  const providers = settings.get("llm-pi-ai")?.providers ?? {};
+  return providers[PROVIDER]?.apiKeyEnv ?? providers[LEGACY_PROVIDER]?.apiKeyEnv ?? API_KEY_ENV;
+}
+
+function settingsAccess(service, settingsNs) {
+  return {
+    get: () => typeof service.get === "function"
+      ? service.get(settingsNs)
+      : service.describe().find((entry) => entry.ns === settingsNs)?.value,
+    revision: () => typeof service.get !== "function" && typeof service.describe === "function"
+      ? service.describe().find((entry) => entry.ns === settingsNs)?.revision
+      : undefined,
+    mutate: (_ns, ops, revision) => service.mutate(settingsNs, ops, revision),
+  };
+}
+
+function validModelOverrides(models) {
+  if (!Array.isArray(models) || models.length > 100) return false;
+  const ids = new Set();
+  for (const model of models) {
+    if (!model || typeof model !== "object" || Array.isArray(model)
+      || typeof model.id !== "string" || !model.id.trim() || model.id.length > 200
+      || ids.has(model.id)) return false;
+    ids.add(model.id);
+    if (model.name !== undefined && (typeof model.name !== "string" || model.name.length > 200)) return false;
+    for (const key of ["contextWindow", "maxTokens"]) {
+      if (model[key] !== undefined && (!Number.isSafeInteger(model[key]) || model[key] <= 0)) return false;
+    }
+    if (model.input !== undefined && (!Array.isArray(model.input)
+      || model.input.some((value) => value !== "text" && value !== "image"))) return false;
+  }
+  return true;
+}
+
+export const __testing = Object.freeze({ settingsAccess, setMode, validModelOverrides, localPost });
+
+/**
+ * 密钥掩码：露出类型前缀与「标识段」末 3 位，中间用固定长度星号。
+ *
+ * 已知的静态 Key 结构（来源：workbuddy2api-hub 的 wb_accounts.py）：
+ *   `ck_<id>.<secret>` / `pt_<id>.<secret>`
+ * 前缀至少有两种（`ck_`、`pt_`），不能只认 `ck_`。
+ *
+ * 本实现对齐官方客户端的展示风格——`ck_********qyo`，即露出标识段末 3 位。
+ * 星号数量固定为 8，不随原串长度变化，避免泄露密钥真实长度。
+ *
+ * 对不符合该结构的输入（无前缀、无分隔点、过短）一律退化为「前缀 + 星号」，
+ * 不猜测、不截出可能重复的片段。
+ */
+function maskApiKey(value) {
+  const text = typeof value === "string" ? value : "";
+  if (!text) return "";
+  const prefixMatch = /^([a-z]{2,4}_)/i.exec(text);
+  const prefix = prefixMatch ? prefixMatch[1] : "";
+  const stars = "*".repeat(8);
+  // 标识段：首个 `.` 之前的部分；没有分隔点时整串即标识段。
+  const head = text.includes(".") ? text.slice(0, text.indexOf(".")) : text;
+  // 去掉前缀后的标识体，需至少 3 位才有可展示的尾部。
+  const id = head.slice(prefix.length);
+  if (id.length < 3) return `${prefix}${stars}`;
+  return `${prefix}${stars}${id.slice(-3)}`;
+}
+
+function textLabel(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function storedApiKeyRef() {
+  return `WORKBUDDY_API_KEY_DSH_${Date.now().toString(36).toUpperCase()}_${randomBytes(6).toString("hex").toUpperCase()}`;
+}
+
+async function readApiKeyStore(credentials) {
+  for (const ref of [WORKBUDDY_API_KEYS_REF, LEGACY_API_KEYS_REF]) {
+    const stored = await credentials.resolve(credentialRef(ref));
+    if (stored?.value) return parseWorkBuddyApiKeys(stored.value);
+  }
+  return createWorkBuddyApiKeyStore();
+}
+
+async function writeApiKeyStore(credentials, store) {
+  const normalized = createWorkBuddyApiKeyStore(store?.entries ?? [], store?.activeId);
+  if (normalized.entries.length === 0) {
+    await credentials.unset(credentialRef(WORKBUDDY_API_KEYS_REF));
+    await credentials.unset(credentialRef(LEGACY_API_KEYS_REF));
+    return;
+  }
+  await credentials.set(credentialRef(WORKBUDDY_API_KEYS_REF), serializeWorkBuddyApiKeys(normalized));
+  await credentials.unset(credentialRef(LEGACY_API_KEYS_REF));
+}
+
+async function currentApiKeyState(webCtx, settings) {
+  const store = await readApiKeyStore(webCtx.credentials);
+  const apiMode = authenticationMode(settings.get("llm-pi-ai")) === "api-key";
+  const ref = apiMode ? configuredApiKeyRef(settings) : undefined;
+  const items = [];
+  const seenRefs = new Set();
+  for (const envRef of [API_KEY_ENV, LEGACY_API_KEY_ENV]) {
+    const environment = await webCtx.credentials.resolve(credentialRef(envRef));
+    if (environment?.value) {
+      items.push({
+        id: `env:${envRef}`,
+        kind: "environment",
+        label: `环境变量 ${envRef}`,
+        ref: envRef,
+        configured: true,
+        masked: maskApiKey(environment.value),
+        source: environment.source,
+      });
+      seenRefs.add(envRef);
+    }
+  }
+  for (const entry of workBuddyApiKeyEntries(store)) {
+    if (seenRefs.has(entry.ref)) continue;
+    const resolved = await webCtx.credentials.resolve(credentialRef(entry.ref));
+    items.push({
+      ...entry,
+      kind: "dsh",
+      configured: Boolean(resolved?.value),
+      ...(resolved?.value ? { masked: maskApiKey(resolved.value), source: resolved.source } : {}),
+    });
+    seenRefs.add(entry.ref);
+  }
+  if (ref && !seenRefs.has(ref)) {
+    const resolved = await webCtx.credentials.resolve(credentialRef(ref));
+    if (resolved?.value) {
+      items.push({
+        id: `dsh:${ref}`,
+        kind: ENV_SOURCES.has(resolved.source) ? "environment" : "dsh",
+        label: ENV_SOURCES.has(resolved.source) ? `环境变量 ${ref}` : "DSH 默认 API Key",
+        ref,
+        configured: true,
+        masked: maskApiKey(resolved.value),
+        source: resolved.source,
+      });
+    }
+  }
+  const configured = apiMode
+    ? items.find((item) => item.ref === ref)
+      ?? (ref === API_KEY_ENV ? items.find((item) => item.ref === LEGACY_API_KEY_ENV) : undefined)
+    : undefined;
+  const active = configured ?? items.find((item) => item.id === store.activeId) ?? items[0];
+  return {
+    apiKeys: items,
+    activeApiKeyId: active?.id ?? null,
+    apiKeyConfigured: Boolean(configured?.configured),
+  };
+}
+
+async function readSessionStore(credentials) {
+  for (const ref of [WORKBUDDY_SESSIONS_REF, LEGACY_SESSIONS_REF]) {
+    const stored = await credentials.resolve(credentialRef(ref));
+    if (stored?.value) return parseWorkBuddySessions(stored.value);
+  }
+  for (const ref of [WORKBUDDY_SESSION_REF, LEGACY_SESSION_REF]) {
+    const legacy = await credentials.resolve(credentialRef(ref));
+    if (legacy?.value) return createWorkBuddySessionStore([parseWorkBuddySession(legacy.value)]);
+  }
+  return createWorkBuddySessionStore();
+}
+
+async function writeSessionStore(credentials, store) {
+  const active = activeWorkBuddySession(store);
+  if (!active) {
+    await credentials.unset(credentialRef(WORKBUDDY_SESSIONS_REF));
+    await credentials.unset(credentialRef(WORKBUDDY_SESSION_REF));
+    await credentials.unset(credentialRef(LEGACY_SESSIONS_REF));
+    await credentials.unset(credentialRef(LEGACY_SESSION_REF));
+    return;
+  }
+  await credentials.set(credentialRef(WORKBUDDY_SESSIONS_REF), serializeWorkBuddySessions(store));
+  // Keep the old single-session reference as a compatibility pointer for older plugin versions.
+  await credentials.set(credentialRef(WORKBUDDY_SESSION_REF), serializeWorkBuddySession(active));
+  await credentials.unset(credentialRef(LEGACY_SESSIONS_REF));
+  await credentials.unset(credentialRef(LEGACY_SESSION_REF));
+}
+
+async function readSessionRouting(credentials) {
+  const stored = await credentials.resolve(credentialRef(WORKBUDDY_SESSION_ROUTING_REF));
+  return stored?.value ? parseWorkBuddySessionRouting(stored.value) : createWorkBuddySessionRoutingState();
+}
+
+async function writeSessionRouting(credentials, state) {
+  await credentials.set(credentialRef(WORKBUDDY_SESSION_ROUTING_REF), serializeWorkBuddySessionRouting(state));
+}
+
+function sessionIdOf(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+async function clearSessionBindings(credentials, predicate) {
+  const state = await readSessionRouting(credentials);
+  const bindings = Object.fromEntries(Object.entries(state.bindings).filter(([, binding]) => !predicate(binding)));
+  const clearRecent = state.lastUsed && predicate(state.lastUsed);
+  if (clearRecent || Object.keys(bindings).length !== Object.keys(state.bindings).length) {
+    await writeSessionRouting(credentials, {
+      ...state,
+      bindings,
+      ...(clearRecent ? { lastUsed: undefined } : {}),
+    });
+  }
+}
+
+async function resolveSession(webCtx, accountId, sessionId) {
+  const store = await readSessionStore(webCtx.credentials);
+  const routing = await readSessionRouting(webCtx.credentials);
+  const binding = routing.enabled && sessionIdOf(sessionId) ? routing.bindings[sessionIdOf(sessionId)] : undefined;
+  const boundAccountId = binding?.mode === "token" ? binding.accountId : undefined;
+  const requestedId = typeof accountId === "string" && accountId
+    ? accountId
+    : boundAccountId ?? store.activeId;
+  let session = store.sessions.find((entry) => entry.id === requestedId) ?? activeWorkBuddySession(store);
+  if (!session) throw new Error("没有找到该 WorkBuddy 登录账号");
+  if (boundAccountId && session.id !== boundAccountId) throw new Error("当前会话绑定的 WorkBuddy 登录账号不存在");
+  if (sessionNeedsRefresh(session)) {
+    session = { ...session, ...(await refreshWorkBuddySession(session)), updatedAt: Date.now() };
+    const nextStore = {
+      ...store,
+      sessions: store.sessions.map((entry) => entry.id === session.id ? session : entry),
+    };
+    await writeSessionStore(webCtx.credentials, nextStore);
+  }
+  return session;
+}
+
+export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
+  ctx.inject(["webServer", "settings", "credentials"], (webCtx) => {
+    const settings = settingsAccess(webCtx.settings, settingsNs);
+    let loginPromise;
+    const currentState = async (requestedSessionId) => {
+      const sessionId = sessionIdOf(requestedSessionId);
+      const store = await readSessionStore(webCtx.credentials);
+      const active = activeWorkBuddySession(store);
+      const routing = await readSessionRouting(webCtx.credentials);
+      const apiKeys = await currentApiKeyState(webCtx, settings);
+      const globalMode = authenticationMode(settings.get("llm-pi-ai"));
+      const sessionBinding = routing.enabled && sessionId ? routing.bindings[sessionId] : undefined;
+      const recentBinding = routing.enabled ? routing.lastUsed : undefined;
+      const exactAccount = sessionBinding?.mode === "token" ? store.sessions.find((entry) => entry.id === sessionBinding.accountId) : undefined;
+      const exactApiKey = sessionBinding?.mode === "api-key" ? apiKeys.apiKeys.find((entry) => entry.ref === sessionBinding.apiKeyRef) : undefined;
+      const recentAccount = recentBinding?.mode === "token" ? store.sessions.find((entry) => entry.id === recentBinding.accountId) : undefined;
+      const recentApiKey = recentBinding?.mode === "api-key" ? apiKeys.apiKeys.find((entry) => entry.ref === recentBinding.apiKeyRef) : undefined;
+      const sessionBindingValid = !sessionBinding || (sessionBinding.mode === "token" ? Boolean(exactAccount) : Boolean(exactApiKey?.configured));
+      const recentBindingValid = !recentBinding || (recentBinding.mode === "token" ? Boolean(recentAccount) : Boolean(recentApiKey?.configured));
+      const effectiveBinding = sessionBinding;
+      const suggestedBinding = !sessionBinding && recentBindingValid ? recentBinding : undefined;
+      // Unbound Sessions display the new-Session default, but runtime auth only
+      // becomes exact after the first model call persists it for that Session.
+      const displayedBinding = effectiveBinding ?? suggestedBinding;
+      const boundAccount = displayedBinding?.mode === "token" ? (effectiveBinding ? exactAccount : recentAccount) : undefined;
+      const boundApiKey = displayedBinding?.mode === "api-key" ? (effectiveBinding ? exactApiKey : recentApiKey) : undefined;
+      const mode = displayedBinding?.mode ?? globalMode;
+      return {
+        ok: true,
+        mode,
+        globalMode,
+        routingEnabled: routing.enabled,
+        sessionId: sessionId ?? null,
+        sessionBinding: sessionBinding ?? null,
+        sessionBindingValid,
+        lastUsedBinding: recentBinding ?? null,
+        lastUsedBindingValid: recentBindingValid,
+        effectiveBinding: effectiveBinding ?? null,
+        suggestedBinding: suggestedBinding ?? null,
+        suggestedAccountId: suggestedBinding?.mode === "token" ? recentAccount?.id ?? null : null,
+        suggestedApiKeyId: suggestedBinding?.mode === "api-key" ? recentApiKey?.id ?? null : null,
+        authenticated: displayedBinding
+          ? displayedBinding.mode === "token" ? Boolean(boundAccount) : Boolean(boundApiKey?.configured)
+          : globalMode === "token" ? active !== undefined : apiKeys.apiKeyConfigured,
+        activeAccountId: displayedBinding?.mode === "token" ? boundAccount?.id ?? null : active?.id ?? null,
+        globalActiveAccountId: active?.id ?? null,
+        accounts: workBuddySessionAccounts(store),
+        ...apiKeys,
+        activeApiKeyId: displayedBinding?.mode === "api-key" ? boundApiKey?.id ?? null : apiKeys.activeApiKeyId,
+        globalActiveApiKeyId: apiKeys.activeApiKeyId,
+        apiKeyConfigured: mode === "api-key" && (displayedBinding?.mode === "api-key" ? Boolean(boundApiKey?.configured) : apiKeys.apiKeyConfigured),
+      };
+    };
+    const status = async (req, res) => {
+      try {
+        const sessionId = new URL(req.url, "http://127.0.0.1").searchParams.get("sessionId");
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "读取 WorkBuddy 认证状态失败" });
+      }
+    };
+    const models = async (req, res) => {
+      try {
+        const providers = settings.get("llm-pi-ai")?.providers ?? {};
+        const profile = providers[PROVIDER] ?? providers[LEGACY_PROVIDER];
+        if (req.method === "GET") return json(res, 200, {
+          ok: true,
+          models: profile?.models ?? null,
+          revision: settings.revision(),
+        });
+        if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+        if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面编辑模型" });
+        const body = await requestBody(req);
+        if (body.action === "discover") {
+          return json(res, 200, { ok: true, models: await webCtx.llm.discoverModels(settingsNs, { provider: PROVIDER }) });
+        }
+        if (body.action !== "save" && body.action !== "reset") return json(res, 400, { ok: false, message: "模型操作无效" });
+        if (body.action === "save" && !validModelOverrides(body.models)) return json(res, 400, { ok: false, message: "模型列表格式无效" });
+        if (profile === undefined && body.action === "reset") return json(res, 200, { ok: true, models: null, revision: settings.revision() });
+        const path = ["providers", providers[PROVIDER] === undefined && providers[LEGACY_PROVIDER] !== undefined ? LEGACY_PROVIDER : PROVIDER];
+        const ops = profile === undefined
+          ? [{ op: "set", path, value: { apiKeyEnv: API_KEY_ENV, ...(body.action === "save" ? { models: body.models } : {}) } }]
+          : [body.action === "save"
+            ? { op: "set", path: [...path, "models"], value: body.models }
+            : { op: "unset", path: [...path, "models"] }];
+        await settings.mutate("llm-pi-ai", ops, body.revision);
+        return json(res, 200, { ok: true, models: body.action === "save" ? body.models : null, revision: settings.revision() });
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "编辑 WorkBuddy 模型失败" });
+      }
+    };
+    const routing = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面切换会话认证" });
+      try {
+        const body = await requestBody(req);
+        if (typeof body.enabled !== "boolean") return json(res, 400, { ok: false, message: "会话级认证开关参数无效" });
+        const state = await readSessionRouting(webCtx.credentials);
+        await writeSessionRouting(webCtx.credentials, { ...state, enabled: body.enabled });
+        json(res, 200, await currentState(body.sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "切换会话级认证失败" });
+      }
+    };
+    const unbind = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面解除会话认证" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        if (!sessionId) return json(res, 400, { ok: false, message: "缺少当前会话 ID" });
+        const state = await readSessionRouting(webCtx.credentials);
+        if (Object.hasOwn(state.bindings, sessionId)) {
+          const bindings = { ...state.bindings };
+          delete bindings[sessionId];
+          await writeSessionRouting(webCtx.credentials, { ...state, bindings });
+        }
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "解除会话认证失败" });
+      }
+    };
+    const apiKey = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面切换认证方式" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        const routingState = await readSessionRouting(webCtx.credentials);
+        const sessionRouting = routingState.enabled && sessionId;
+        let ref = API_KEY_ENV;
+        if (typeof body.keyId === "string" && body.keyId) {
+          const state = await currentApiKeyState(webCtx, settings);
+          const selected = state.apiKeys.find((entry) => entry.id === body.keyId);
+          if (!selected) return json(res, 404, { ok: false, message: "没有找到该 WorkBuddy API Key" });
+          if (!selected.configured) return json(res, 409, { ok: false, message: "该 API Key 已不可用，请删除后重新添加" });
+          ref = selected.ref;
+          if (!sessionRouting && !routingState.enabled) {
+            const store = await readApiKeyStore(webCtx.credentials);
+            await writeApiKeyStore(webCtx.credentials, { ...store, activeId: selected.kind === "dsh" ? selected.id : null });
+          }
+        }
+        credentialRef(ref);
+        if (routingState.enabled && !body.keyId) {
+          const state = await currentApiKeyState(webCtx, settings);
+          const selected = state.apiKeys.find((entry) => entry.ref === ref) ?? state.apiKeys.find((entry) => entry.configured);
+          if (!selected?.configured) return json(res, 409, { ok: false, message: "未检测到可用 WorkBuddy API Key" });
+          ref = selected.ref;
+        }
+        if (sessionRouting) {
+          await writeSessionRouting(webCtx.credentials, {
+            ...routingState,
+            bindings: { ...routingState.bindings, [sessionId]: { mode: "api-key", apiKeyRef: ref } },
+            lastUsed: { mode: "api-key", apiKeyRef: ref },
+          });
+        } else if (routingState.enabled) {
+          await writeSessionRouting(webCtx.credentials, {
+            ...routingState,
+            lastUsed: { mode: "api-key", apiKeyRef: ref },
+          });
+        } else {
+          await setMode(settings, "api-key", ref);
+        }
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "切换 API Key 失败" });
+      }
+    };
+    const addApiKey = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面保存 API Key" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        const value = typeof body.key === "string" ? body.key.trim() : "";
+        if (!value) return json(res, 400, { ok: false, message: "请输入 API Key" });
+        if (value.length > 16 * 1024) return json(res, 413, { ok: false, message: "API Key 长度超出限制" });
+        const store = await readApiKeyStore(webCtx.credentials);
+        const ref = storedApiKeyRef();
+        const entry = {
+          id: `dsh:${ref}`,
+          ref,
+          label: textLabel(body.label) ?? `DSH API Key ${store.entries.length + 1}`,
+        };
+        await webCtx.credentials.set(credentialRef(ref), value);
+        try {
+          const next = upsertWorkBuddyApiKey(store, entry);
+          await writeApiKeyStore(webCtx.credentials, next);
+          const routingState = await readSessionRouting(webCtx.credentials);
+          if (routingState.enabled && sessionId) {
+            await writeSessionRouting(webCtx.credentials, {
+              ...routingState,
+              bindings: { ...routingState.bindings, [sessionId]: { mode: "api-key", apiKeyRef: ref } },
+              lastUsed: { mode: "api-key", apiKeyRef: ref },
+            });
+          } else if (routingState.enabled) {
+            await writeSessionRouting(webCtx.credentials, {
+              ...routingState,
+              lastUsed: { mode: "api-key", apiKeyRef: ref },
+            });
+          } else {
+            await setMode(settings, "api-key", ref);
+          }
+        } catch (error) {
+          await webCtx.credentials.unset(credentialRef(ref));
+          throw error;
+        }
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "保存 API Key 失败" });
+      }
+    };
+    const removeApiKey = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面删除 API Key" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        const store = await readApiKeyStore(webCtx.credentials);
+        const entry = store.entries.find((item) => item.id === body.keyId);
+        if (!entry) return json(res, 404, { ok: false, message: "没有找到该 WorkBuddy API Key" });
+        const activeRef = configuredApiKeyRef(settings);
+        await webCtx.credentials.unset(credentialRef(entry.ref));
+        const remaining = store.entries.filter((item) => item.id !== entry.id);
+        await writeApiKeyStore(webCtx.credentials, { version: 1, activeId: remaining[0]?.id, entries: remaining });
+        await clearSessionBindings(webCtx.credentials, (binding) => binding.mode === "api-key" && binding.apiKeyRef === entry.ref);
+        if (authenticationMode(settings.get("llm-pi-ai")) === "api-key" && activeRef === entry.ref) {
+          const environment = await webCtx.credentials.resolve(credentialRef(API_KEY_ENV));
+          let fallback = API_KEY_ENV;
+          if (!environment?.value) {
+            for (const candidate of remaining) {
+              if ((await webCtx.credentials.resolve(credentialRef(candidate.ref)))?.value) {
+                fallback = candidate.ref;
+                break;
+              }
+            }
+          }
+          await setMode(settings, "api-key", fallback);
+        }
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "删除 API Key 失败" });
+      }
+    };
+    const token = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面切换认证方式" });
+      try {
+        const body = await requestBody(req);
+        const store = await readSessionStore(webCtx.credentials);
+        const sessionId = sessionIdOf(body.sessionId);
+        const accountId = typeof body.accountId === "string" ? body.accountId : store.activeId;
+        const active = store.sessions.find((entry) => entry.id === accountId);
+        if (!active) return json(res, 409, { ok: false, message: "没有找到该 WorkBuddy 登录账号" });
+        const routingState = await readSessionRouting(webCtx.credentials);
+        if (routingState.enabled && sessionId) {
+          await writeSessionRouting(webCtx.credentials, {
+            ...routingState,
+            bindings: { ...routingState.bindings, [sessionId]: { mode: "token", accountId: active.id } },
+            lastUsed: { mode: "token", accountId: active.id },
+          });
+        } else if (routingState.enabled) {
+          await writeSessionRouting(webCtx.credentials, {
+            ...routingState,
+            lastUsed: { mode: "token", accountId: active.id },
+          });
+        } else {
+          await writeSessionStore(webCtx.credentials, { ...store, activeId: active.id });
+          await setMode(settings, "token");
+        }
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "切换令牌账号失败" });
+      }
+    };
+    const credits = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面查询 WorkBuddy 积分" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        const selection = await currentState(sessionId);
+        if (selection.mode !== "token") {
+          return json(res, 200, {
+            ok: true,
+            accountId: null,
+            credits: null,
+            totalDosage: null,
+            segments: [],
+            unlimited: false,
+            cycleResetTime: null,
+            creditError: "积分查询仅支持 WorkBuddy 令牌登录",
+            todayUsage: null,
+            todayUsageError: "今日请求量查询仅支持 WorkBuddy 令牌登录",
+          });
+        }
+        const session = await resolveSession(webCtx, selection.activeAccountId ?? body.accountId, sessionId);
+        const result = await fetchWorkBuddyCredits(session);
+        json(res, 200, {
+          ok: true,
+          accountId: session.id,
+          credits: result.credits,
+          totalDosage: result.totalDosage,
+          segments: result.segments,
+          unlimited: !!result.unlimited,
+          cycleResetTime: result.cycleResetTime ?? null,
+          creditError: result.creditError ?? null,
+          todayUsage: result.todayUsage ?? null,
+          todayUsageError: result.todayUsageError ?? null,
+        });
+      } catch (error) {
+        json(res, 200, {
+          ok: true,
+          accountId: null,
+          credits: null,
+          totalDosage: null,
+          segments: [],
+          unlimited: false,
+          cycleResetTime: null,
+          creditError: error instanceof Error ? error.message : "查询 WorkBuddy 积分失败",
+          todayUsage: null,
+          todayUsageError: error instanceof Error ? error.message : "查询 WorkBuddy 今日请求量失败",
+        });
+      }
+    };
+    const login = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面登录" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        loginPromise ??= (async () => {
+          const session = await loginWorkBuddy();
+          const store = await readSessionStore(webCtx.credentials);
+          const nextStore = upsertWorkBuddySession(store, session);
+          await writeSessionStore(webCtx.credentials, nextStore);
+          const routingState = await readSessionRouting(webCtx.credentials);
+          if (routingState.enabled && sessionId) {
+            await writeSessionRouting(webCtx.credentials, {
+              ...routingState,
+              bindings: { ...routingState.bindings, [sessionId]: { mode: "token", accountId: nextStore.activeId } },
+              lastUsed: { mode: "token", accountId: nextStore.activeId },
+            });
+          } else if (routingState.enabled) {
+            await writeSessionRouting(webCtx.credentials, {
+              ...routingState,
+              lastUsed: { mode: "token", accountId: nextStore.activeId },
+            });
+          } else {
+            await setMode(settings, "token");
+          }
+        })().finally(() => {
+          loginPromise = undefined;
+        });
+        await loginPromise;
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "WorkBuddy 登录失败" });
+      }
+    };
+    const remove = async (req, res) => {
+      if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+      if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面管理登录账号" });
+      try {
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        const store = await readSessionStore(webCtx.credentials);
+        const accountId = typeof body.accountId === "string" ? body.accountId : store.activeId;
+        const sessions = store.sessions.filter((entry) => entry.id !== accountId);
+        if (sessions.length === store.sessions.length) return json(res, 404, { ok: false, message: "没有找到该 WorkBuddy 登录账号" });
+        const activeId = accountId === store.activeId ? sessions[0]?.id : store.activeId;
+        await writeSessionStore(webCtx.credentials, { version: 1, activeId, sessions });
+        await clearSessionBindings(webCtx.credentials, (binding) => binding.mode === "token" && binding.accountId === accountId);
+        json(res, 200, await currentState(sessionId));
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "删除令牌账号失败" });
+      }
+    };
+    const contextWindow = async (req, res) => {
+      try {
+        const providers = settings.get("llm-pi-ai")?.providers ?? {};
+        const profile = providers[PROVIDER] ?? providers[LEGACY_PROVIDER];
+        const models = Array.isArray(profile?.models) ? profile.models : [];
+        if (req.method === "GET") {
+          const modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+          const entry = models.find((model) => model?.id === modelId);
+          const fallback = DEFAULT_CONTEXT_WINDOWS[modelId];
+          return json(res, 200, {
+            ok: true,
+            model: modelId,
+            contextWindow: entry?.contextWindow ?? fallback ?? null,
+            revision: settings.revision(),
+          });
+        }
+        if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+        if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面调整上下文窗口" });
+        const body = await requestBody(req);
+        if (typeof body.model !== "string" || !body.model.trim()) {
+          return json(res, 400, { ok: false, message: "缺少模型 ID" });
+        }
+        if (!Number.isSafeInteger(body.contextWindow) || body.contextWindow <= 0) {
+          return json(res, 400, { ok: false, message: "上下文窗口必须是正整数" });
+        }
+        if (body.contextWindow > MAX_CONTEXT_WINDOW) {
+          return json(res, 400, { ok: false, message: `上下文窗口不能超过 ${MAX_CONTEXT_WINDOW}` });
+        }
+        const modelId = body.model.trim();
+        const existing = models.findIndex((model) => model?.id === modelId);
+        const nextModels = existing >= 0
+          ? models.map((model, index) => index === existing ? { ...model, contextWindow: body.contextWindow } : model)
+          : [...models, { id: modelId, contextWindow: body.contextWindow }];
+        const path = ["providers", providers[PROVIDER] === undefined && providers[LEGACY_PROVIDER] !== undefined ? LEGACY_PROVIDER : PROVIDER];
+        const ops = profile === undefined
+          ? [{ op: "set", path, value: { apiKeyEnv: API_KEY_ENV, models: nextModels } }]
+          : [{ op: "set", path: [...path, "models"], value: nextModels }];
+        await settings.mutate("llm-pi-ai", ops, body.revision);
+        return json(res, 200, {
+          ok: true,
+          model: modelId,
+          contextWindow: body.contextWindow,
+          models: nextModels,
+          revision: settings.revision(),
+        });
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "调整上下文窗口失败" });
+      }
+    };
+    webCtx.effect(() => {
+      const dispose = [
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/status`, handler: status }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/models`, handler: models }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/context-window`, handler: contextWindow }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/routing`, handler: routing }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/unbind`, handler: unbind }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/api-key`, handler: apiKey }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/api-key/add`, handler: addApiKey }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/api-key/remove`, handler: removeApiKey }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/token`, handler: token }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/credits`, handler: credits }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/login`, handler: login }),
+        webCtx.webServer.register({ kind: "exact", path: `${ROUTE}/remove`, handler: remove }),
+      ];
+      return () => dispose.forEach((fn) => fn());
+    }, "llm-workbuddy: web login routes");
+  });
+}
