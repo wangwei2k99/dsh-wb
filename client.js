@@ -686,41 +686,58 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * `apply` 收到的 ctx 存在模块级，供下面的默认模型回落读取
-     * `modelDirectories`。控件本身渲染在 `apply` 之外的作用域，
-     * 拿不到那个形参。
+     * 部署默认模型，由本插件自己的 host 路由给出（`status.defaultSelection`）。
+     *
+     * 为什么不直接读客户端的 `modelDirectories`：那个服务的 `catalog.store`
+     * 是内部实现，`subscribe` 之类的细节没有公开契约，依赖它会随宿主版本
+     * 静默失效。改走自己的路由，来源是宿主的 `agentDefaultModel` 服务，
+     * 与 `buildModelCatalog` 的默认值同源 —— 也就是 `agent-default-model`
+     * 的配置，不是模型列表的第一项。
+     *
+     * 读不到就返回 undefined，控件不显示，绝不猜一个模型名。
      */
-    let pluginCtx;
+    // 用哨兵区分「还没请求过」和「请求过但宿主没有默认模型」，
+    // 否则后者会让每个控件每次渲染都重发一次请求。
+    const UNKNOWN = Symbol("workbuddy.defaultSelection.unknown");
+    let defaultSelectionCache = UNKNOWN;
+
+    function useDefaultSelection() {
+      const [value, setValue] = useState(defaultSelectionCache);
+      useEffect(() => {
+        let disposed = false;
+        if (defaultSelectionCache !== UNKNOWN) return undefined;
+        authRequest("status")
+          .then((status) => {
+            defaultSelectionCache = status?.defaultSelection ?? undefined;
+            if (!disposed) setValue(defaultSelectionCache);
+          })
+          .catch(() => {
+            // 失败也不留 UNKNOWN，避免控件反复重试；下次载入重新尝试。
+            defaultSelectionCache = undefined;
+            if (!disposed) setValue(undefined);
+          });
+        return () => { disposed = true; };
+      }, []);
+      return value === UNKNOWN ? undefined : value;
+    }
 
     /**
-     * 新会话（Hero 相位、尚未发出第一条消息）时 `modelSelection` 投影是
-     * `{ lastUsed: null, next: null }` —— 宿主对空会话不给任何选择，真正的
-     * 默认来自 `modelDirectories` 的目录快照：内置控件用的是
-     * `projected.next ?? catalog.value.default`。
-     * 这里沿用同一条回落链，避免把模型名写死在插件里。
-     * 一旦会话产生选择，投影优先，回落值自动失效。
+     * 解析「当前这件控件该针对哪个模型」，只读一次来源。
+     * provider 与 model 必须同时来自同一处：宿主目录是异步刷新的，
+     * 各读一次可能拼出根本不存在的组合。
+     *
+     * @returns `source` 区分来源：`projected` 是会话里的持久选择，
+     *   `default` 是部署默认（空会话），`none` 说明还拿不到。
      */
-    function directoryDefault() {
-      try {
-        const service = typeof pluginCtx?.get === "function" ? pluginCtx.get("modelDirectories") : undefined;
-        const catalog = service?.catalog?.store?.getSnapshot?.();
-        // 目录还没 ready 时 value 为 null，此时没有可信的默认值。
-        return catalog?.value?.default ?? undefined;
-      } catch {
-        return undefined;
+    function resolveSelection(selection, fallback) {
+      const projected = selection?.next ?? selection?.lastUsed ?? undefined;
+      if (projected !== undefined) {
+        return { provider: projected.provider, model: projected.model, source: "projected" };
       }
-    }
-
-    function selectionOf(selection) {
-      return selection?.next ?? selection?.lastUsed ?? undefined;
-    }
-
-    function selectedProvider(selection) {
-      return selectionOf(selection)?.provider ?? directoryDefault()?.provider;
-    }
-
-    function selectedModelId(selection) {
-      return selectionOf(selection)?.model ?? directoryDefault()?.model;
+      if (fallback !== undefined) {
+        return { provider: fallback.provider, model: fallback.model, source: "default" };
+      }
+      return { provider: undefined, model: undefined, source: "none" };
     }
 
     function pendingCredentialOptions(status, mode) {
@@ -910,9 +927,10 @@ window.__ModuleLoader__.load({
       } catch {
         selection = undefined;
       }
-      // 空会话投影没有 provider：按 DSH 目录的默认模型判断，
+      // 空会话投影没有 provider：按部署默认模型判断，
       // 否则整条用量条在新会话里不渲染。
-      const provider = selectedProvider(selection);
+      const resolved = resolveSelection(selection, useDefaultSelection());
+      const provider = resolved.provider;
       const selected = isWorkBuddyProvider(provider);
       const modlens = isModLensWorkBuddyProvider(provider);
       const [state, setState] = useState(null);
@@ -2212,11 +2230,17 @@ window.__ModuleLoader__.load({
       } catch {
         selection = undefined;
       }
-      // 与用量条同理：空会话投影没有 provider/model，沿用 DSH 目录的默认模型，
-      // 让上下文窗口控件在发出第一条消息之前也能显示和调整。
-      const provider = selectedProvider(selection);
+      // 空会话投影没有 provider/model，沿用 DSH 目录的部署默认模型，
+      // 让控件在发出第一条消息前也能显示。
+      //
+      // 关键区别：`default` 表示这不是会话里真正选中的模型，只是部署默认。
+      // 此时控件必须只读 —— 写档位会按这个 modelId 落到默认模型的配置上，
+      // 用户以为在给别的模型设，实际改错了对象。
+      const resolved = resolveSelection(selection, useDefaultSelection());
+      const provider = resolved.provider;
       const selected = isWorkBuddyProvider(provider);
-      const modelId = selectedModelId(selection);
+      const modelId = resolved.model;
+      const readOnly = resolved.source !== "projected";
       const [value, setValue] = useState(null);
       const [tokens, setTokens] = useState(null);
       // 上游天花板，用来把四档目标截断到该模型真正能装下的范围。
@@ -2277,6 +2301,8 @@ window.__ModuleLoader__.load({
 
       const capabilities = { contextWindow: ceiling, maxTokens: outputCeiling };
       const apply = async (budget) => {
+        // 只读态绝不写配置：此时 modelId 只是部署默认，不是会话里选中的模型。
+        if (readOnly) return;
         if (busy || (budget.contextWindow === value && budget.maxTokens === tokens)) return;
         const previous = { contextWindow: value, maxTokens: tokens };
         setBusy(true);
@@ -2325,9 +2351,13 @@ window.__ModuleLoader__.load({
         key: "context-window",
         ref: rootRef,
         "data-workbuddy-context-window": true,
+        "data-workbuddy-readonly": readOnly ? "1" : undefined,
         role: "group",
         "aria-label": "WorkBuddy 使用场景",
-        title: error ?? current.hint,
+        title: error
+          ?? (readOnly
+            ? `当前显示的是部署默认模型（${modelId}）的档位。发出第一条消息后，可在此调整本会话实际所用模型的档位。`
+            : current.hint),
         style: {
           position: "relative",
           display: "inline-flex",
@@ -2339,17 +2369,20 @@ window.__ModuleLoader__.load({
           key: "trigger",
           type: "button",
           className: "wb-cw-trigger",
-          "aria-haspopup": "menu",
-          "aria-expanded": open,
-          "aria-label": `使用场景：${current.label}`,
-          disabled: busy,
+          // 只读时不宣称有弹出菜单，避免读屏与用户都以为能改。
+          "aria-haspopup": readOnly ? undefined : "menu",
+          "aria-expanded": readOnly ? undefined : open,
+          "aria-label": readOnly
+            ? `使用场景：${current.label}（部署默认模型，发出消息后可调整）`
+            : `使用场景：${current.label}`,
+          disabled: busy || readOnly,
           style: error
             ? { color: "var(--dsw-alias-state-error-primary, #f25a5a)" }
             : undefined,
-          onClick: () => setOpen(!open),
+          onClick: () => { if (!readOnly) setOpen(!open); },
         }, [
           createElement("span", { key: "label", className: "wb-cw-label" }, current.label),
-          createElement("span", {
+          !readOnly && createElement("span", {
             key: "chevron",
             className: open ? "wb-cw-chevron is-open" : "wb-cw-chevron",
             "aria-hidden": true,
@@ -2364,7 +2397,7 @@ window.__ModuleLoader__.load({
             strokeLinejoin: "round",
           }))),
         ]),
-        open && createElement("div", {
+        !readOnly && open && createElement("div", {
           key: "menu",
           className: "wb-cw-menu",
           role: "menu",
@@ -2399,7 +2432,6 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      pluginCtx = ctx;
       ensureStyles();
       installComposerDockLayout();
       /**

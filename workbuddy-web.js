@@ -335,6 +335,31 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
     const settings = settingsAccess(webCtx.settings, settingsNs);
     let loginPromise;
     /**
+     * 部署级的默认模型。
+     *
+     * 新会话在发出第一条消息前，`modelSelection` 投影是空的；此时页面要知道
+     * 「马上会用哪个模型」，否则上下文窗口控件无从判断是否该出现。
+     * 宿主自己也是这么取的 —— `buildModelCatalog` 的默认值来自
+     * `ctx.agentDefaultModel.currentSelection()`，不是模型列表的第一项，
+     * 所以增删模型或调整顺序都不会影响它。
+     *
+     * 服务缺失时返回 undefined，由前端回落到不显示，绝不猜一个模型名。
+     */
+    const defaultSelection = () => {
+      try {
+        const service = typeof webCtx.get === "function" ? webCtx.get("agentDefaultModel") : undefined;
+        const current = service?.currentSelection?.();
+        if (typeof current?.provider !== "string" || typeof current?.model !== "string") return undefined;
+        return {
+          provider: current.provider,
+          model: current.model,
+          ...(typeof current.reasoningEffort === "string" ? { reasoningEffort: current.reasoningEffort } : {}),
+        };
+      } catch {
+        return undefined;
+      }
+    };
+    /**
      * 上游目录给出的容量上限（`maxInputTokens` / `maxOutputTokens`）。
      * 页面按它给「上下文窗口」和「最大输出」分档，避免写出上游不支持的组合。
      * 结果缓存一小段时间：翻设置页不该每次都打一次配置接口。
@@ -391,6 +416,8 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         ok: true,
         mode,
         globalMode,
+        // 空会话时前端靠它判断「马上会用哪个模型」，决定控件是否出现。
+        defaultSelection: defaultSelection() ?? null,
         routingEnabled: routing.enabled,
         sessionId: sessionId ?? null,
         sessionBinding: sessionBinding ?? null,

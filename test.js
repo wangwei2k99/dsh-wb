@@ -325,17 +325,49 @@ test("新版 WorkBuddy 卡片保留旧版认证入口并提供模型编辑", () 
   assert.equal(webTesting.validModelOverrides([{ id: "bad", maxTokens: -1 }]), false);
 });
 
-test("空会话按 DSH 目录默认模型回落，不把模型名写死", () => {
+test("空会话按部署默认模型回落，不把模型名写死", () => {
   const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
-  // 新会话投影是 { lastUsed: null, next: null }，必须回落到目录默认值，
+  // 新会话投影是 { lastUsed: null, next: null }，必须回落到部署默认值，
   // 否则用量条与上下文窗口控件都会因取不到 provider/model 而不渲染。
-  assert.match(client, /projected\.next \?\? catalog\.value\.default|directoryDefault\(\)/);
   assert.match(client, /selection\?\.next \?\? selection\?\.lastUsed/);
-  assert.match(client, /get\("modelDirectories"\)/);
-  assert.match(client, /catalog\?\.value\?\.default/);
+  // 默认值来源是宿主的 agentDefaultModel（经本插件自己的路由下发），
+  // 不依赖客户端内部服务模型的私有字段。
+  assert.match(client, /status\?\.defaultSelection/);
+  assert.match(client, /function useDefaultSelection/);
   // 回落链里不允许出现写死的 provider/model 名。
   assert.doesNotMatch(client, /const DEFAULT_PROVIDER = "workbuddy-cn"/);
   assert.doesNotMatch(client, /const DEFAULT_MODEL = "deepseek/);
+});
+
+test("默认模型来自宿主 agentDefaultModel，而非模型列表首项", () => {
+  const web = readFileSync(new URL("./workbuddy-web.js", import.meta.url), "utf8");
+  // 宿主 buildModelCatalog 的默认值就是 currentSelection()：
+  // 增删模型或调整顺序都不该改变它。
+  assert.match(web, /get\("agentDefaultModel"\)/);
+  assert.match(web, /currentSelection\?\.\(\)/);
+  assert.match(web, /defaultSelection: defaultSelection\(\) \?\? null/);
+});
+
+test("provider 与 model 必须来自同一次解析，避免跨代际拼装", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  assert.match(client, /function resolveSelection\(selection, fallback\)/);
+  assert.match(client, /source: "projected"/);
+  assert.match(client, /source: "default"/);
+  assert.match(client, /source: "none"/);
+  // 旧实现各读一次来源，可能 provider 与 model 来自不同快照。
+  assert.doesNotMatch(client, /selectedProvider\(/);
+  assert.doesNotMatch(client, /selectedModelId\(/);
+});
+
+test("空会话的上下文窗口控件只读，绝不写配置", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  // 空会话的 modelId 只是部署默认，按它写档位会改错模型配置。
+  assert.match(client, /const readOnly = resolved\.source !== "projected"/);
+  assert.match(client, /if \(readOnly\) return;/);
+  assert.match(client, /disabled: busy \|\| readOnly/);
+  // 只读时不弹菜单，也不宣称有菜单。
+  assert.match(client, /"aria-haspopup": readOnly \? undefined : "menu"/);
+  assert.match(client, /!readOnly && open && createElement\("div", \{\s*key: "menu"/);
 });
 
 test("新版模型接口只修改 WorkBuddy 条目并保留认证模式", async () => {
