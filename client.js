@@ -286,7 +286,8 @@ window.__ModuleLoader__.load({
  */
 [data-wb-ui] option,
 [data-workbuddy-context-window] option {
-  background-color: var(--dsw-alias-bg-overlay, #2b2b2b);
+  /* 与自定义菜单同一档表面色，避免两处下拉深浅不一。 */
+  background-color: var(--dsw-alias-bg-layer-2, #2c2c2e);
   color: var(--dsw-alias-label-primary, #e6e6e6);
 }
 /* 选中项在部分平台由系统绘制，显式给 checked 项留出可辨识的底色。 */
@@ -365,10 +366,39 @@ window.__ModuleLoader__.load({
   padding: 4px;
   overflow: hidden;
   border: 0;
-  border-radius: var(--dsw-radius-md, 12px);
-  background: var(--dsw-alias-bg-overlay, #2b2b2b);
-  box-shadow: var(--dsw-elevation-prominent, 0 8px 24px rgba(0,0,0,.35));
+  isolation: isolate;
+  /* 官方下拉统一用 radius-lg（16px），不是 md。 */
+  border-radius: var(--dsw-radius-lg, 16px);
+  background: 0 0;
   color: var(--dsw-alias-label-primary, #e6e6e6);
+}
+/*
+ * 表面色照官方菜单的做法，不要图省事直接写不透明色。
+ *
+ * 官方菜单是「半透明表面 + 毛玻璃」：--dsw-specific-menu 暗色是 #43454a73。
+ * 少了 backdrop-filter，同一支半透明色叠在背后的会话内容上会显得偏实、
+ * 偏亮；与旁边原生菜单并排时深浅就对不上，也就是「背景色不一致」的来源。
+ *
+ * 描边单独用伪元素画 .5px，这是官方写法：直接写 border 会把内容挤进去。
+ */
+[data-workbuddy-context-window] .wb-cw-menu::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--dsw-specific-menu, rgba(67, 69, 74, .45));
+  backdrop-filter: var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%));
+  -webkit-backdrop-filter: var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%));
+  pointer-events: none;
+}
+[data-workbuddy-context-window] .wb-cw-menu::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: .5px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, .06));
+  border-radius: inherit;
+  pointer-events: none;
 }
 [data-workbuddy-context-window] .wb-cw-option {
   display: flex;

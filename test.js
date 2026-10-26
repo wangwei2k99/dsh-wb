@@ -411,6 +411,20 @@ test("清除会话档位必须显式传 null，缺字段不能当清除", () => 
   assert.match(web, /必须是正整数，或显式传 null 清除/);
 });
 
+test("下拉菜单与官方原生菜单同档表面色", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  // 官方菜单表面色是 --dsw-specific-menu（暗色 #43454a73），不是 bg-overlay。
+  // 用 bg-overlay 会比原生菜单亮一大截，并排时明显不一致。
+  assert.doesNotMatch(client, /background:\s*var\(--dsw-alias-bg-overlay/);
+  assert.match(client, /\.wb-cw-menu::before \{[\s\S]{0,400}?background: var\(--dsw-specific-menu/);
+  // 半透明表面必须配毛玻璃，缺了它会显得偏实偏亮。
+  assert.match(client, /backdrop-filter: var\(--dsw-menu-backdrop-filter/);
+  // 官方下拉用 radius-lg，不是 md。
+  assert.match(client, /border-radius: var\(--dsw-radius-lg, 16px\)/);
+  // 描边用伪元素画 .5px，直接写 border 会挤动内容。
+  assert.match(client, /\.wb-cw-menu::after \{[\s\S]{0,200}?border: \.5px solid var\(--dsw-alias-border-l1/);
+});
+
 test("headroom 按窗口等比缩放，不写死绝对值", () => {
   const tiers = readFileSync(new URL("./session-tiers.js", import.meta.url), "utf8");
   // 写死 64K headroom 会把 32K 窗口的输出压到 8K，违背输出预算目标。
