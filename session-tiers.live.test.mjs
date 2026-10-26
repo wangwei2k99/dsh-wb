@@ -162,4 +162,84 @@ test("非法覆盖被拒绝，不会写入脏数据", async () => {
   assert.equal(api.read("sess-A").override, null, "拒绝后不得留下覆盖");
 });
 
+test("agent/request 内部出错时原样放行，不拖垮请求", async () => {
+  const h = host();
+  const { api } = installSessionTiers(h.ctx, undefined);
+  api.write("sess-A", { contextWindow: 32_000 });
+  const handler = h.handlers.get("agent/request");
+  // 构造一个会让档位逻辑炸掉的 payload：agent 的 id 取值器抛错。
+  const hostile = {
+    agent: {
+      get id() {
+        throw new Error("boom");
+      },
+    },
+  };
+  const original = { provider: "p", model: "m", maxTokens: 128_000 };
+  const config = await handler(hostile, () => Promise.resolve(original));
+  // 关键：不能抛，也不能把配置改坏。
+  assert.deepEqual(config, original, "出错时必须原样返回宿主配置");
+});
+
+test("prepareCall 内部出错时退回原方法，模型调用照常", async () => {
+  const h = host();
+  const { api } = installSessionTiers(h.ctx, undefined);
+  api.write("sess-A", { contextWindow: 32_000 });
+  // 让 currentInitiator 抛错，模拟档位逻辑自身失败。
+  h.ctx.agents.currentInitiator = () => {
+    throw new Error("boom");
+  };
+  const prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
+  // 档位没生效可以接受，但请求必须成功，且窗口是模型原本的值。
+  assert.equal(prepared.context.contextWindow, h.baseWindow, "出错时应回落到模型默认窗口");
+  assert.ok(Number.isInteger(prepared.config.maxTokens), "必须仍返回可用的 maxTokens");
+});
+
+test("宿主自身失败不被吞掉", async () => {
+  // 先让底层方法失败，再安装，验证包装层不会把宿主的错误吞掉或改判。
+  const h = host();
+  const failing = function failing() {
+    return Promise.reject(new Error("provider exploded"));
+  };
+  h.llmPrototype.prepareCall = failing;
+  installSessionTiers(h.ctx, undefined);
+  await assert.rejects(
+    () => h.ctx.llm.prepareCall({ provider: "p", model: "m" }),
+    /provider exploded/,
+    "宿主的失败原因必须原样上抛，不能被吞掉",
+  );
+});
+
+test("缺 agents 服务时干净降级，模型调用照常", async () => {
+  // agents 不在 inject 里，缺失时插件必须照常工作，只是没有会话级档位。
+  const h = host();
+  const ctx = { llm: h.ctx.llm, effect: h.ctx.effect, on: h.ctx.on };
+  const { installed, api } = installSessionTiers(ctx, undefined);
+  assert.equal(installed, true, "缺 agents 不应让安装失败");
+  const prepared = await ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
+  assert.equal(prepared.context.contextWindow, h.baseWindow, "模型调用必须照常");
+  const write = api.write("sess-A", { contextWindow: 32_000 });
+  assert.equal(write.ok, false, "没有会话身份时写覆盖应被拒绝而不是抛错");
+});
+
+test("未声明的服务属性访问会抛错时仍能安装", () => {
+  // 真实 cordis 对未 inject 的服务，属性访问直接抛
+  // `cannot get property "agents" without inject`。
+  // 这里复现那个语义：一旦代码直接读 ctx.agents 就会炸掉整个插件。
+  const h = host();
+  const ctx = new Proxy(
+    { llm: h.ctx.llm, effect: h.ctx.effect, on: h.ctx.on },
+    {
+      get(target, key) {
+        if (key in target) return target[key];
+        if (key === "get") return () => undefined;
+        throw new Error(`cannot get property "${String(key)}" without inject`);
+      },
+    },
+  );
+  // 关键：不能抛。
+  const { installed } = installSessionTiers(ctx, undefined);
+  assert.equal(installed, true, "访问未声明服务不得让安装失败");
+});
+
 console.log("session-tiers 真实链路测试开始");

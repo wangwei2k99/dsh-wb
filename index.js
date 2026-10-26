@@ -41,7 +41,10 @@ import { installSessionTiers } from "./session-tiers.js";
 export { Config };
 
 export const name = "dsh-workbuddy";
-export const inject = ["llm", "agents"];
+// 只硬依赖 llm：它是本插件的核心（注册 provider）。
+// agents 不是必需的 —— 会话级档位靠它拿 sessionId，拿不到就不启用档位，
+// 但模型接入必须照常工作。写进 inject 会让整个插件在缺该服务时变 INACTIVE。
+export const inject = ["llm"];
 
 const NS = typeof dshSettings.settingsNamespace === "function" ? dshSettings.settingsNamespace("llm-pi-ai") : "llm-pi-ai";
 const PROVIDER = "workbuddy-cn";

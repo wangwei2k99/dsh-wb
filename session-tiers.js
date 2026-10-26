@@ -114,10 +114,30 @@ export function installSessionTiers(ctx, config) {
   /** sessionId -> { contextWindow, maxTokens } 由最近一次解析推出的实际值 */
   const resolved = new Map();
 
-  // 两个服务都通过 `inject` 声明在 index.js，这里直接读；
-  // 仍做防御性判断，因为测试替身可能只提供其中一个。
-  const agents = ctx.agents ?? (typeof ctx.get === "function" ? ctx.get("agents") : undefined);
-  const llm = ctx.llm ?? (typeof ctx.get === "function" ? ctx.get("llm") : undefined);
+  // 读取可选服务。
+  //
+  // 注意两件事：
+  //  1. cordis 对未在 inject 中声明的服务，**属性访问会直接抛**
+  //     `cannot get property "xxx" without inject`，而不是返回 undefined；
+  //     一旦抛出去，整个插件就不激活，连模型接入都一起没了。
+  //  2. 已声明（inject 里）的服务用属性访问才有值，`ctx.get` 未必有实现。
+  //
+  // 所以顺序是：先 try 属性访问，失败再退回 `ctx.get`，两者都失败就当作没有。
+  const read = (key) => {
+    try {
+      const direct = ctx[key];
+      if (direct !== undefined && direct !== null) return direct;
+    } catch {
+      // 未声明服务：属性访问抛错，落到 ctx.get。
+    }
+    try {
+      return typeof ctx.get === "function" ? ctx.get(key) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const agents = read("agents");
+  const llm = read("llm");
   const llmPrototype = prototypeOf(llm);
   const originalPrepareCall = llmPrototype?.prepareCall;
   const canPatchPrepare = typeof originalPrepareCall === "function";
@@ -171,23 +191,31 @@ export function installSessionTiers(ctx, config) {
   /**
    * seam 1：官方 `agent/request` waterfall。
    * 在宿主把 config 冻结成 request/header 之前把 maxTokens 收敛掉。
+   *
+   * 这是 waterfall：处理函数抛错会让整个请求失败。档位只是附加功能，
+   * 因此任何自身异常都必须吞掉并原样放行，绝不拖垮对话。
    */
   effect(() => {
     if (typeof ctx.on !== "function") return () => {};
     const stop = ctx.on("agent/request", async (payload, next) => {
-      hits.agentRequest += 1;
       const config = await next();
-      const sessionId = payload?.agent?.id;
-      const active = overrideOf(typeof sessionId === "string" && sessionId !== "" ? sessionId : undefined);
-      if (active === undefined || config === null || typeof config !== "object") return config;
-      // 窗口信息要等 prepareCall 才拿得到；这里先按本会话窗口收紧输出预留，
-      // 保证 request/header 与压缩策略看到的预算和覆盖窗口自洽。
-      const window = active.requested.contextWindow;
-      const maxTokens = clampCompletion(active.requested.maxTokens ?? config.maxTokens, window, settings);
-      hits.applied += 1;
-      remember(active.sessionId, { contextWindow: window, maxTokens });
-      if (config.maxTokens === maxTokens) return config;
-      return { ...config, maxTokens };
+      try {
+        hits.agentRequest += 1;
+        const sessionId = payload?.agent?.id;
+        const active = overrideOf(typeof sessionId === "string" && sessionId !== "" ? sessionId : undefined);
+        if (active === undefined || config === null || typeof config !== "object") return config;
+        // 窗口信息要等 prepareCall 才拿得到；这里先按本会话窗口收紧输出预留，
+        // 保证 request/header 与压缩策略看到的预算和覆盖窗口自洽。
+        const window = active.requested.contextWindow;
+        const maxTokens = clampCompletion(active.requested.maxTokens ?? config.maxTokens, window, settings);
+        hits.applied += 1;
+        remember(active.sessionId, { contextWindow: window, maxTokens });
+        if (config.maxTokens === maxTokens) return config;
+        return { ...config, maxTokens };
+      } catch {
+        // 出任何问题都退回宿主原本的配置。
+        return config;
+      }
     });
     return () => stop?.();
   }, "workbuddy: session tier agent/request");
@@ -199,34 +227,57 @@ export function installSessionTiers(ctx, config) {
    */
   if (canPatchPrepare) {
     effect(() => {
+      /**
+       * 这是全局替换 `llm.prepareCall`：一旦它抛错，所有模型调用都会失败。
+       * 因此除了业务分支，整体还要再包一层 —— 档位逻辑出问题时退回原方法，
+       * 用户可以没有档位，但不能不能对话。
+       */
       const patched = function prepareCallWithSessionTier(callConfig, signal, configure) {
-        hits.prepareCall += 1;
-        const active = overrideOf(currentSessionId());
-        if (active === undefined) return originalPrepareCall.call(this, callConfig, signal, configure);
-        let resolution;
-        const configureCall = (controls, modelInfo) => {
-          resolution = resolveSessionWindow(modelInfo?.context?.contextWindow, active.requested.contextWindow);
-          const seeded = typeof configure === "function" ? configure(controls, modelInfo) : controls;
-          if (resolution.changed !== true) return seeded;
-          const maxTokens = clampCompletion(
-            active.requested.maxTokens ?? seeded?.maxTokens ?? modelInfo?.defaultMaxTokens,
-            resolution.effective,
-            settings,
+        try {
+          const active = overrideOf(currentSessionId());
+          if (active === undefined) return originalPrepareCall.call(this, callConfig, signal, configure);
+          hits.prepareCall += 1;
+          let resolution;
+          const configureCall = (controls, modelInfo) => {
+            try {
+              resolution = resolveSessionWindow(modelInfo?.context?.contextWindow, active.requested.contextWindow);
+              const seeded = typeof configure === "function" ? configure(controls, modelInfo) : controls;
+              if (resolution.changed !== true) return seeded;
+              const maxTokens = clampCompletion(
+                active.requested.maxTokens ?? seeded?.maxTokens ?? modelInfo?.defaultMaxTokens,
+                resolution.effective,
+                settings,
+              );
+              return { ...seeded, maxTokens };
+            } catch {
+              // configure 出错就交回宿主原本的选值逻辑。
+              return typeof configure === "function" ? configure(controls, modelInfo) : controls;
+            }
+          };
+          return Promise.resolve(originalPrepareCall.call(this, callConfig, signal, configureCall)).then(
+            (prepared) => {
+              try {
+                if (resolution === undefined || resolution.changed !== true || prepared === null || prepared === undefined) return prepared;
+                remember(active.sessionId, {
+                  contextWindow: resolution.effective,
+                  maxTokens: clampCompletion(prepared?.config?.maxTokens, resolution.effective, settings),
+                });
+                if (prepared.context === undefined || prepared.context === null) return prepared;
+                return Object.freeze({
+                  ...prepared,
+                  context: Object.freeze({ ...prepared.context, contextWindow: resolution.effective }),
+                });
+              } catch {
+                return prepared;
+              }
+            },
+            // 宿主的失败原因原样上抛，不改判、不吞掉错误本身。
+            (error) => { throw error; },
           );
-          return { ...seeded, maxTokens };
-        };
-        return Promise.resolve(originalPrepareCall.call(this, callConfig, signal, configureCall)).then((prepared) => {
-          if (resolution === undefined || resolution.changed !== true || prepared === null || prepared === undefined) return prepared;
-          remember(active.sessionId, {
-            contextWindow: resolution.effective,
-            maxTokens: clampCompletion(prepared?.config?.maxTokens, resolution.effective, settings),
-          });
-          if (prepared.context === undefined || prepared.context === null) return prepared;
-          return Object.freeze({
-            ...prepared,
-            context: Object.freeze({ ...prepared.context, contextWindow: resolution.effective }),
-          });
-        });
+        } catch {
+          // 兜底：任何同步异常都退回宿主原本的方法，保证模型调用照常进行。
+          return originalPrepareCall.call(this, callConfig, signal, configure);
+        }
       };
       llmPrototype.prepareCall = patched;
       return () => {
@@ -264,6 +315,11 @@ export function installSessionTiers(ctx, config) {
     },
     /** 设置覆盖；`tier` 为 null 时清除（回到 profile 默认值）。 */
     write(sessionId, tier) {
+      // 没有 agents 就取不到「当前会话」，请求路径永远查不到这份覆盖。
+      // 此时写入会变成静默失效：接口成功、实际不生效。宁可明确拒绝。
+      if (typeof agents?.currentInitiator !== "function") {
+        return { ok: false, error: "当前宿主未提供 agents 服务，会话级档位不可用" };
+      }
       const id = typeof sessionId === "string" && sessionId !== "" ? sessionId : currentSessionId();
       if (id === undefined) return { ok: false, error: "no active session" };
       if (tier === null || tier === undefined) {
