@@ -359,15 +359,63 @@ test("provider 与 model 必须来自同一次解析，避免跨代际拼装", (
   assert.doesNotMatch(client, /selectedModelId\(/);
 });
 
-test("空会话的上下文窗口控件只读，绝不写配置", () => {
+test("档位写会话覆盖，不再写全局配置", () => {
   const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
-  // 空会话的 modelId 只是部署默认，按它写档位会改错模型配置。
-  assert.match(client, /const readOnly = resolved\.source !== "projected"/);
+  // 档位写的是本会话的覆盖值：不动 profile 配置，两个会话因此互不影响。
+  assert.match(client, /authRequest\("session-tier", \{/);
+  assert.match(client, /sessionId,/);
+  // 旧实现走 context-window 写全局模型定义，正是「两边一起变」的根因。
+  assert.doesNotMatch(client, /authRequest\("context-window", \{\s*model: modelId,\s*contextWindow: budget\.contextWindow/);
+});
+
+test("没有会话 id 时档位控件只读", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  // 覆盖值必须挂在某个会话上，没有会话 id 就无处可写。
+  assert.match(client, /const readOnly = sessionKey === undefined/);
   assert.match(client, /if \(readOnly\) return;/);
   assert.match(client, /disabled: busy \|\| readOnly/);
-  // 只读时不弹菜单，也不宣称有菜单。
+  // 只读时不宣称有菜单。
   assert.match(client, /"aria-haspopup": readOnly \? undefined : "menu"/);
-  assert.match(client, /!readOnly && open && createElement\("div", \{\s*key: "menu"/);
+});
+
+test("会话覆盖先读后写，且提供恢复默认", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  // 初值优先用本会话覆盖，没有再回落到模型级默认值。
+  assert.match(client, /tier\?\.override \?\? null/);
+  assert.match(client, /override\?\.contextWindow/);
+  // 撤销入口只在存在覆盖时出现，并写 null 清除。
+  assert.match(client, /contextWindow: null \}\)/);
+  assert.match(client, /hasOverride && createElement/);
+});
+
+test("会话级档位只动内存，按 sessionId 隔离", () => {
+  const tiers = readFileSync(new URL("./session-tiers.js", import.meta.url), "utf8");
+  // 官方 waterfall：签名带 agent，直接拿 sessionId，无需 patch 原型猜会话。
+  assert.match(tiers, /ctx\.on\("agent\/request"/);
+  // 覆盖值只存在 Map 里，不写配置、不写会话日志。
+  assert.match(tiers, /const overrides = new Map\(\)/);
+  assert.doesNotMatch(tiers, /settings\.mutate/);
+  assert.doesNotMatch(tiers, /credentials\.set/);
+  // 窗口必须与完成预留自洽，否则压缩会抛「没有消息预算」。
+  assert.match(tiers, /export function clampCompletion/);
+  assert.match(tiers, /export function resolveSessionWindow/);
+  // 覆盖不超过模型基准窗口：放大窗口不属于会话层能力。
+  assert.match(tiers, /Math\.min\(requested, base\)/);
+});
+
+test("清除会话档位必须显式传 null，缺字段不能当清除", () => {
+  const web = readFileSync(new URL("./workbuddy-web.js", import.meta.url), "utf8");
+  // 漏传 contextWindow 若被当成清除，会静默抹掉用户的设置。
+  assert.match(web, /Object\.hasOwn\(body, "contextWindow"\) && body\.contextWindow === null/);
+  assert.match(web, /explicitClear/);
+  assert.match(web, /必须是正整数，或显式传 null 清除/);
+});
+
+test("headroom 按窗口等比缩放，不写死绝对值", () => {
+  const tiers = readFileSync(new URL("./session-tiers.js", import.meta.url), "utf8");
+  // 写死 64K headroom 会把 32K 窗口的输出压到 8K，违背输出预算目标。
+  assert.match(tiers, /headroomRatio/);
+  assert.doesNotMatch(tiers, /headroomTokens: 65_536/);
 });
 
 test("新版模型接口只修改 WorkBuddy 条目并保留认证模式", async () => {

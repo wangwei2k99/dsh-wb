@@ -36,11 +36,12 @@ import {
 } from "./workbuddy-auth.js";
 import { installWorkBuddyWeb } from "./workbuddy-web.js";
 import { probeEndpoint } from "./workbuddy-discovery.js";
+import { installSessionTiers } from "./session-tiers.js";
 
 export { Config };
 
 export const name = "dsh-workbuddy";
-export const inject = ["llm"];
+export const inject = ["llm", "agents"];
 
 const NS = typeof dshSettings.settingsNamespace === "function" ? dshSettings.settingsNamespace("llm-pi-ai") : "llm-pi-ai";
 const PROVIDER = "workbuddy-cn";
@@ -1744,8 +1745,11 @@ export function apply(ctx, config) {
   const activate = () => {
     if (booted) return;
     booted = true;
+    // 会话级档位：只改内存里的覆盖，不动 profile 配置。
+    // 必须在 Web 路由之前装好，路由才能读到它的读写接口。
+    const tiers = installSessionTiers(ctx, config?.sessionTiers);
     // 只有真正赢下的这一份才挂 Web 路由与设置面板，避免两条 routing 抢同一路径。
-    installWorkBuddyWeb(ctx, settingsNs);
+    installWorkBuddyWeb(ctx, settingsNs, tiers.api);
     if (modernSettings && typeof ctx.on === "function") ctx.on("loader/volatile-update", refreshRegistrations);
     if (typeof ctx.on === "function") ctx.on("llm/adapters-updated", deferHeal);
     installSettingsCompat(ctx, settingsNs, Config, config ?? { providers: {}}, {

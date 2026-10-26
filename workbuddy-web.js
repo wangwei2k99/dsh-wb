@@ -330,7 +330,7 @@ async function resolveSession(webCtx, accountId, sessionId) {
   return session;
 }
 
-export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
+export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai", sessionTiers) {
   ctx.inject(["webServer", "settings", "credentials"], (webCtx) => {
     const settings = settingsAccess(webCtx.settings, settingsNs);
     let loginPromise;
@@ -838,6 +838,55 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         json(res, 500, { ok: false, message: error instanceof Error ? error.message : "调整上下文窗口失败" });
       }
     };
+    /**
+     * 会话级档位：读/写当前会话的窗口与输出预算覆盖。
+     *
+     * 覆盖只存在宿主内存里，不写 profile 配置，也不写会话日志，
+     * 因此同时开的两个会话互不影响。新会话不携带覆盖，回到 profile 默认值。
+     *
+     * `sessionId` 未传时由宿主侧的 `currentInitiator()` 推断 —— 该接口
+     * 依赖当前执行链，HTTP 请求不在会话链上，所以客户端应显式传。
+     */
+    const sessionTier = async (req, res) => {
+      try {
+        if (sessionTiers === undefined) {
+          return json(res, 503, { ok: false, message: "会话级档位不可用（宿主未提供 agents/llm 服务）" });
+        }
+        if (req.method === "GET") {
+          const query = new URL(req.url, "http://127.0.0.1").searchParams;
+          const state = sessionTiers.read(query.get("sessionId") ?? undefined);
+          return json(res, 200, {
+            ok: true,
+            ...state,
+            stats: sessionTiers.stats(),
+          });
+        }
+        if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+        if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面调整会话档位" });
+        const body = await requestBody(req);
+        const sessionId = sessionIdOf(body.sessionId);
+        if (sessionId === undefined) return json(res, 400, { ok: false, message: "缺少会话 ID" });
+        // 只有显式 `contextWindow: null` 才算清除。字段直接缺失是客户端 bug，
+        // 不能当成清除 —— 否则漏传一个字段就会静默抹掉用户的设置。
+        const explicitClear = Object.hasOwn(body, "contextWindow") && body.contextWindow === null;
+        if (!explicitClear && !Number.isSafeInteger(Number(body.contextWindow))) {
+          return json(res, 400, { ok: false, message: "contextWindow 必须是正整数，或显式传 null 清除" });
+        }
+        const result = explicitClear
+          ? sessionTiers.write(sessionId, null)
+          : sessionTiers.write(sessionId, {
+            contextWindow: Number(body.contextWindow),
+            ...(Number.isSafeInteger(body.maxTokens) ? { maxTokens: Number(body.maxTokens) } : {}),
+          });
+        if (result.ok !== true) {
+          // 「超过模型基准窗口」由调度层再校验，这里只挡明显非法的输入。
+          return json(res, 400, { ok: false, message: result.error ?? "设置会话档位失败" });
+        }
+        return json(res, 200, { ok: true, ...result, stats: sessionTiers.stats() });
+      } catch (error) {
+        json(res, 500, { ok: false, message: error instanceof Error ? error.message : "读写会话档位失败" });
+      }
+    };
     webCtx.effect(() => {
       /**
        * 注册一条路由。被占用的路径不算失败：进程里可能还留着一个用旧路由的
@@ -855,6 +904,7 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai") {
         take(`${ROUTE}/status`, status),
         take(`${ROUTE}/models`, models),
         take(`${ROUTE}/context-window`, contextWindow),
+        take(`${ROUTE}/session-tier`, sessionTier),
         take(`${ROUTE}/routing`, routing),
         take(`${ROUTE}/unbind`, unbind),
         take(`${ROUTE}/api-key`, apiKey),

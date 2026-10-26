@@ -2230,17 +2230,15 @@ window.__ModuleLoader__.load({
       } catch {
         selection = undefined;
       }
-      // 空会话投影没有 provider/model，沿用 DSH 目录的部署默认模型，
-      // 让控件在发出第一条消息前也能显示。
-      //
-      // 关键区别：`default` 表示这不是会话里真正选中的模型，只是部署默认。
-      // 此时控件必须只读 —— 写档位会按这个 modelId 落到默认模型的配置上，
-      // 用户以为在给别的模型设，实际改错了对象。
+      // 空会话投影没有 provider/model，沿用部署默认模型，让控件在发出第一条消息前也能显示。
       const resolved = resolveSelection(selection, useDefaultSelection());
       const provider = resolved.provider;
       const selected = isWorkBuddyProvider(provider);
       const modelId = resolved.model;
-      const readOnly = resolved.source !== "projected";
+      // 档位现在写的是「本会话的覆盖」，不动 profile 配置，所以即使是部署默认模型
+      // 也可以安全调整 —— 真正的边界是拿不到会话 id，那才是无处可写。
+      const sessionKey = typeof sessionId === "string" && sessionId !== "" ? sessionId : undefined;
+      const readOnly = sessionKey === undefined;
       const [value, setValue] = useState(null);
       const [tokens, setTokens] = useState(null);
       // 上游天花板，用来把四档目标截断到该模型真正能装下的范围。
@@ -2248,6 +2246,8 @@ window.__ModuleLoader__.load({
       const [outputCeiling, setOutputCeiling] = useState(null);
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState(null);
+      // 本会话是否已偏离 profile 默认值。菜单里据此显示「恢复默认」。
+      const [hasOverride, setHasOverride] = useState(false);
       // 菜单开合状态必须与上面几个 hook 一起声明在 early return 之前：
       // React 要求每次渲染的 hook 调用顺序一致，放到 return null 之后会在
       // 缺少会话/模型时直接崩掉整个组件（表现为控件消失）。
@@ -2263,11 +2263,26 @@ window.__ModuleLoader__.load({
           setOutputCeiling(null);
           return () => { disposed = true; };
         }
-        authRequest("context-window", undefined, undefined, { model: modelId })
-          .then((result) => {
+        // 先问本会话有没有覆盖，再取模型级默认值作为上限与回落。
+        Promise.all([
+          authRequest("context-window", undefined, undefined, { model: modelId }),
+          sessionKey === undefined
+            ? Promise.resolve(null)
+            : authRequest("session-tier", undefined, undefined, { sessionId: sessionKey }).catch(() => null),
+        ]).then(([result, tier]) => {
             if (disposed) return;
-            setValue(typeof result?.contextWindow === "number" ? result.contextWindow : DEFAULT_CONTEXT_WINDOW);
-            setTokens(typeof result?.maxTokens === "number" ? result.maxTokens : DEFAULT_MAX_TOKENS);
+            const override = tier?.override ?? null;
+            setHasOverride(override !== null);
+            setValue(
+              typeof override?.contextWindow === "number"
+                ? override.contextWindow
+                : typeof result?.contextWindow === "number" ? result.contextWindow : DEFAULT_CONTEXT_WINDOW,
+            );
+            setTokens(
+              typeof override?.maxTokens === "number"
+                ? override.maxTokens
+                : typeof result?.maxTokens === "number" ? result.maxTokens : DEFAULT_MAX_TOKENS,
+            );
             setCeiling(typeof result?.contextWindowMax === "number" && result.contextWindowMax > 0 ? result.contextWindowMax : null);
             setOutputCeiling(typeof result?.maxTokensMax === "number" && result.maxTokensMax > 0 ? result.maxTokensMax : null);
           }).catch(() => {
@@ -2278,7 +2293,7 @@ window.__ModuleLoader__.load({
             setOutputCeiling(null);
           });
         return () => { disposed = true; };
-      }, [selected, modelId]);
+      }, [selected, modelId, sessionKey]);
 
       // 菜单打开时监听外部点击与 Esc 关闭。
       useEffect(() => {
@@ -2301,7 +2316,7 @@ window.__ModuleLoader__.load({
 
       const capabilities = { contextWindow: ceiling, maxTokens: outputCeiling };
       const apply = async (budget) => {
-        // 只读态绝不写配置：此时 modelId 只是部署默认，不是会话里选中的模型。
+        // 没有真实会话 id 时绝不写：此时 modelId 只是部署默认，写下去会改错对象。
         if (readOnly) return;
         if (busy || (budget.contextWindow === value && budget.maxTokens === tokens)) return;
         const previous = { contextWindow: value, maxTokens: tokens };
@@ -2310,12 +2325,15 @@ window.__ModuleLoader__.load({
         setValue(budget.contextWindow);
         setTokens(budget.maxTokens);
         try {
-          await authRequest("context-window", {
-            model: modelId,
+          // 写会话级覆盖：只影响本会话，不动 profile 配置，也不影响别的会话。
+          await authRequest("session-tier", {
+            sessionId,
             contextWindow: budget.contextWindow,
             maxTokens: budget.maxTokens,
+            model: modelId,
           });
           if (typeof window !== "undefined") window.dispatchEvent(new Event(AUTH_STATE_EVENT));
+          setHasOverride(true);
         } catch (cause) {
           setValue(previous.contextWindow);
           setTokens(previous.maxTokens);
@@ -2337,6 +2355,28 @@ window.__ModuleLoader__.load({
         }]
         : presets;
       const current = options.find((option) => option.id === matched) ?? options[0];
+
+      /**
+       * 清除本会话覆盖，回到 profile 默认值。
+       * 仅在有覆盖时才有意义，所以只在覆盖存在时渲染这一项。
+       */
+      const clearOverride = async () => {
+        if (readOnly || busy || !hasOverride) return;
+        setOpen(false);
+        setBusy(true);
+        setError(null);
+        try {
+          await authRequest("session-tier", { sessionId: sessionKey, contextWindow: null });
+          const baseline = await authRequest("context-window", undefined, undefined, { model: modelId });
+          setValue(typeof baseline?.contextWindow === "number" ? baseline.contextWindow : DEFAULT_CONTEXT_WINDOW);
+          setTokens(typeof baseline?.maxTokens === "number" ? baseline.maxTokens : DEFAULT_MAX_TOKENS);
+          setHasOverride(false);
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : "恢复默认失败");
+        } finally {
+          setBusy(false);
+        }
+      };
 
       // 结构照抄 DSH 官方 PermissionSelect：trigger 按钮 + 向上弹出的 Menu。
       // 官方用 ui-primitives 的 Menu 组件，但那是 shell 内部模块、插件无法 require，
@@ -2427,7 +2467,18 @@ window.__ModuleLoader__.load({
             strokeLinecap: "round",
             strokeLinejoin: "round",
           }))),
-        ]))),
+        ])),
+        // 覆盖只作用于本会话，所以撤销入口也留在本会话的菜单里。
+        hasOverride && createElement("button", {
+          key: "reset",
+          type: "button",
+          role: "menuitem",
+          className: "wb-cw-option",
+          title: "只影响当前会话。恢复后本会话回到部署默认的窗口与输出",
+          onClick: () => { void clearOverride(); },
+        }, [
+          createElement("span", { key: "text", className: "wb-cw-option-text" }, "恢复默认"),
+        ])),
       ]);
     }
 
