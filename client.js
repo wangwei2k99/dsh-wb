@@ -685,8 +685,42 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * `apply` 收到的 ctx 存在模块级，供下面的默认模型回落读取
+     * `modelDirectories`。控件本身渲染在 `apply` 之外的作用域，
+     * 拿不到那个形参。
+     */
+    let pluginCtx;
+
+    /**
+     * 新会话（Hero 相位、尚未发出第一条消息）时 `modelSelection` 投影是
+     * `{ lastUsed: null, next: null }` —— 宿主对空会话不给任何选择，真正的
+     * 默认来自 `modelDirectories` 的目录快照：内置控件用的是
+     * `projected.next ?? catalog.value.default`。
+     * 这里沿用同一条回落链，避免把模型名写死在插件里。
+     * 一旦会话产生选择，投影优先，回落值自动失效。
+     */
+    function directoryDefault() {
+      try {
+        const service = typeof pluginCtx?.get === "function" ? pluginCtx.get("modelDirectories") : undefined;
+        const catalog = service?.catalog?.store?.getSnapshot?.();
+        // 目录还没 ready 时 value 为 null，此时没有可信的默认值。
+        return catalog?.value?.default ?? undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    function selectionOf(selection) {
+      return selection?.next ?? selection?.lastUsed ?? undefined;
+    }
+
     function selectedProvider(selection) {
-      return selection?.next?.provider ?? selection?.lastUsed?.provider ?? selection?.provider;
+      return selectionOf(selection)?.provider ?? directoryDefault()?.provider;
+    }
+
+    function selectedModelId(selection) {
+      return selectionOf(selection)?.model ?? directoryDefault()?.model;
     }
 
     function pendingCredentialOptions(status, mode) {
@@ -876,6 +910,8 @@ window.__ModuleLoader__.load({
       } catch {
         selection = undefined;
       }
+      // 空会话投影没有 provider：按 DSH 目录的默认模型判断，
+      // 否则整条用量条在新会话里不渲染。
       const provider = selectedProvider(selection);
       const selected = isWorkBuddyProvider(provider);
       const modlens = isModLensWorkBuddyProvider(provider);
@@ -2176,9 +2212,11 @@ window.__ModuleLoader__.load({
       } catch {
         selection = undefined;
       }
+      // 与用量条同理：空会话投影没有 provider/model，沿用 DSH 目录的默认模型，
+      // 让上下文窗口控件在发出第一条消息之前也能显示和调整。
       const provider = selectedProvider(selection);
       const selected = isWorkBuddyProvider(provider);
-      const modelId = selection?.next?.model ?? selection?.lastUsed?.model ?? selection?.model;
+      const modelId = selectedModelId(selection);
       const [value, setValue] = useState(null);
       const [tokens, setTokens] = useState(null);
       // 上游天花板，用来把四档目标截断到该模型真正能装下的范围。
@@ -2361,6 +2399,7 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      pluginCtx = ctx;
       ensureStyles();
       installComposerDockLayout();
       /**

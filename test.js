@@ -325,6 +325,19 @@ test("新版 WorkBuddy 卡片保留旧版认证入口并提供模型编辑", () 
   assert.equal(webTesting.validModelOverrides([{ id: "bad", maxTokens: -1 }]), false);
 });
 
+test("空会话按 DSH 目录默认模型回落，不把模型名写死", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  // 新会话投影是 { lastUsed: null, next: null }，必须回落到目录默认值，
+  // 否则用量条与上下文窗口控件都会因取不到 provider/model 而不渲染。
+  assert.match(client, /projected\.next \?\? catalog\.value\.default|directoryDefault\(\)/);
+  assert.match(client, /selection\?\.next \?\? selection\?\.lastUsed/);
+  assert.match(client, /get\("modelDirectories"\)/);
+  assert.match(client, /catalog\?\.value\?\.default/);
+  // 回落链里不允许出现写死的 provider/model 名。
+  assert.doesNotMatch(client, /const DEFAULT_PROVIDER = "workbuddy-cn"/);
+  assert.doesNotMatch(client, /const DEFAULT_MODEL = "deepseek/);
+});
+
 test("新版模型接口只修改 WorkBuddy 条目并保留认证模式", async () => {
   const routes = new Map();
   let providers = { "workbuddy-cn": {} };
