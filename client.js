@@ -35,10 +35,6 @@ window.__ModuleLoader__.load({
     /** 没有目录上限时的兜底，与「日常编码」一致。 */
     const DEFAULT_CONTEXT_WINDOW = 200000;
     const DEFAULT_MAX_TOKENS = 32000;
-    /** 使用场景下拉的最小宽度：四个中文字 + 箭头 + 留白。 */
-    const PRESET_SELECT_WIDTH = "112px";
-    /** 「窗口 / 输出」列宽，容得下 1M / 128K。 */
-    const BUDGET_COLUMN_WIDTH = "120px";
 
     /** 预设值与已存值的归位容差：5% 以内视为同一档。 */
     const SNAP_RATIO = 0.05;
@@ -182,8 +178,18 @@ window.__ModuleLoader__.load({
       return hit ? hit.id : PRESET_CUSTOM;
     }
 
-    /** 模型列表“操作”列宽度（删除按钮所在列），表头与数据行共用。 */
-    const MODEL_ACTION_COLUMN_WIDTH = 64;
+    /**
+     * 模型列表六列的相对宽度权重，表头与数据行共用。
+     * 取值为各列「内容需要宽度」的实测值除以 100（= 该列最长的真实内容 + 内边距 + 边框，
+     * 并与表头文字宽取大者）：
+     *   模型 ID 188.6、显示名称 172.2、使用场景 80、窗口/输出 70.5、图片输入 48、操作 46。
+     * 用比例而不是固定像素后，每列的富余量与自身内容同比例，
+     * 任意容器宽度下六列留白率一致（实测标准差 ≤0.3%），
+     * 容器变宽时整体等比放大，不会出现两列被撑开、其余列被压扁。
+     */
+    const MODEL_COLUMN_WEIGHTS = [1.89, 1.72, 0.8, 0.7, 0.48, 0.46];
+
+
     /**
      * API Key 区右侧动作按钮的固定宽度。
      * “删除”与“添加并使用”共用此值，保证上下两行按钮等宽、右缘对齐。
@@ -1874,12 +1880,16 @@ window.__ModuleLoader__.load({
       };
       /**
        * 表头与数据行共用同一套网格列定义，保证逐列对齐。
-       * 前两列等分剩余空间，其余为固定宽度。
+       * 六列都按「内容需要宽度」成比例分配（见 MODEL_COLUMN_WEIGHTS），
+       * 因此各列留白率一致，且随容器宽度整体等比缩放。
        */
-      // 图片输入列只放一个勾选框，因此列宽可以收紧。
-      const MODEL_GRID_COLUMNS = `minmax(0, 1fr) minmax(0, 1fr) ${PRESET_SELECT_WIDTH} ${BUDGET_COLUMN_WIDTH} 72px ${MODEL_ACTION_COLUMN_WIDTH}px`;
-      /** 网格最小宽度：两列弹性字段各留 140px 可读宽度。 */
-      const MODEL_GRID_MIN_WIDTH = "720px";
+      const MODEL_GRID_COLUMNS = MODEL_COLUMN_WEIGHTS.map((weight) => `minmax(0, ${weight}fr)`).join(" ");
+      /**
+       * 网格最小宽度：容器收到 700px 时最窄的「操作」列仍有 48px（删除按钮需 46px），
+       * 六列都还不低于内容需要宽度；再窄才交给 list 的横向滚动。
+       */
+      const MODEL_GRID_MIN_WIDTH = "700px";
+
       const modelGridStyle = (element) => {
         element.style.display = "grid";
         element.style.gridTemplateColumns = MODEL_GRID_COLUMNS;
