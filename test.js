@@ -913,6 +913,23 @@ test("上下文超窗时按剩余空间收敛 maxTokens，塞满窗口则抛出�
     assert.match(error.message, /context_length_exceeded/);
     return true;
   });
+
+  /*
+   * 压缩摘要请求必须原样放行。
+   *
+   * DSH 做压缩时把「要被压缩的历史」原样回放给模型写摘要，所以摘要请求的体积
+   * 几乎等于整个上下文。如果这里照常抛错，上下文越窗就再也无法被压缩——压缩本身
+   * 需要先发出一次越窗请求才能完成。实测会话日志里两次压缩失败抛的都是本函数文案。
+   */
+  const compaction = { maxTokens: 65_536, purpose: "compaction" };
+  // 原样返回同一个对象：既不抛错，也不擅自压低 maxTokens。
+  // 压到 1024 会让摘要在输出上限处被截断（compaction-basic 报 incomplete checkpoint）。
+  assert.strictEqual(__testing.boundContextBudget(model, over, compaction), compaction);
+  assert.throws(() => __testing.boundContextBudget(model, over, options), /context_length_exceeded/);
+  // 普通请求仍然拦：只有压缩才有豁免，别的用途一律照旧。
+  assert.throws(() => __testing.boundContextBudget(model, over, { maxTokens: 128_000, purpose: "chat" }), /context_length_exceeded/);
+  // 模型没配窗口时行为不变。
+  assert.strictEqual(__testing.boundContextBudget({ maxTokens: 1000 }, over, compaction), compaction);
 });
 
 test("上游只回 1 个 token 的 length 判定为上下文溢出，11115 错误带机器可读标记", async () => {
