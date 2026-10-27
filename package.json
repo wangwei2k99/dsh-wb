@@ -50,7 +50,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check session-tiers.js && node --check workbuddy-discovery.js && node --check workbuddy-auth.js && node --check workbuddy-credits.js && node --check workbuddy-web.js && node --check client.js && node --check cli.js && node --test test.js && node --test session-tiers.live.test.mjs && node session-tiers.test.mjs && node cli.js --self-test"
+    "check": "node --check index.js && node --check session-tiers.js && node --check workbuddy-discovery.js && node --check workbuddy-auth.js && node --check workbuddy-credits.js && node --check workbuddy-web.js && node --check client.js && node --check cli.js && node --check e2e.test.mjs && node --test test.js && node --test session-tiers.live.test.mjs && node session-tiers.test.mjs && node cli.js --self-test",
+    "e2e": "node e2e.test.mjs",
+    "test": "npm run check && npm run e2e"
   },
   "dsh": {
     "engines": {

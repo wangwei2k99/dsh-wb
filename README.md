@@ -330,6 +330,80 @@ modlens doctor --json
 反馈问题时，请提供插件版本、DSH 版本、模型名称、认证方式和脱敏后的错误信息。
 **不要公开 API Key、登录令牌或未经脱敏的完整日志。**
 
+## 开发与测试
+
+### 三层测试
+
+| 层次 | 命令 | 依赖真实上游 |
+| --- | --- | --- |
+| 语法 + 单元 + 链路 | `npm run check` | 否 |
+| 端到端 | `npm run e2e` | **是** |
+| 全部 | `npm test` | 是 |
+
+`npm run check` 覆盖 91 项断言（68 单测 + 15 真实链路 + 8 纯逻辑），全部基于
+自建 mock，不联网、不花钱，适合每次改代码就跑。
+
+### 为什么还要端到端测试
+
+mock 覆盖再多也替代不了真链路。曾经有一个让**整个插件不激活**的崩溃：
+cordis 对未在 `inject` 中声明的服务，属性访问是**直接抛错**而非返回 `undefined`，
+而当时 91 项 mock 测试全部通过——因为 mock 里 `ctx` 是个普通对象，怎么读都不抛。
+
+`npm run e2e` 起一个真实的 `dsh headless` 进程，断言：进程退出码为 0、
+上游返回 200、拿到模型正文、无 `MISSING_CREDENTIAL`、插件正常激活。
+上面那个崩溃能让它稳定报错，这是它存在的意义。
+
+### 准备 e2e profile
+
+端到端测试需要一个装了本插件、配好 provider 和凭据的 profile。
+**不要复用 desktop**（日常在用，重启影响你），建议单独建一个：
+
+```powershell
+dsh --profile workbuddy-e2e --from-default-profile headless --dump-config
+dsh plugin --profile workbuddy-e2e add <本仓库路径>
+```
+
+然后在 `~/.dsh/profiles/workbuddy-e2e/cordis.patch.yml` 里写：
+
+```yaml
+# credentials 在 headless 模板里默认 disabled。不启用它，
+# 插件读不到 apiKeyEnv 指向的凭据，请求会以 MISSING_CREDENTIAL 失败。
+- id: credentials
+  name: "@deepseek-ai/dsh-credentials-local"
+  disabled: false
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: workbuddy-cn
+    model: deepseek-v4.1-flash
+- id: dsh-workbuddy
+  name: "@wangwei2k99/dsh-workbuddy"
+  config:
+    providers:
+      workbuddy-cn:
+        apiKeyEnv: WORKBUDDY_API_KEY        # 指向 DSH 已托管的凭据引用，不要写明文
+        models:
+          - id: deepseek-v4.1-flash
+            name: deepseek-v4.1-flash
+            contextWindow: 32000
+            maxTokens: 16000
+            input:
+              - text
+```
+
+profile 名不同时用环境变量指定：
+
+```powershell
+$env:WORKBUDDY_E2E_PROFILE = "my-profile"
+node e2e.test.mjs
+```
+
+找不到 `dsh` 时可用 `DSH_BIN` 指定完整路径。
+脚本在前置条件不满足时会**明确报错并退出（码 2）**，不会静默跳过。
+
+> **成本**：每次 e2e 约 2 次上游请求，prompt 极短，耗时 4 秒左右。
+> 因为它会产生真实调用费用，所以**没有**放进 `npm run check`。
+
 ## 卸载
 
 桌面 Profile：
