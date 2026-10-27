@@ -242,4 +242,26 @@ test("未声明的服务属性访问会抛错时仍能安装", () => {
   assert.equal(installed, true, "访问未声明服务不得让安装失败");
 });
 
+test("重复安装不会套娃，全部卸载后干净还原", async () => {
+  // 插件装成多行、fiber 重启、热重载都会让 install 跑多次。
+  // 裸着包装会互相套娃，且先卸载内层后外层再把内层装回去，导致卸载后仍有残留。
+  const h = host();
+  const base = h.llmPrototype.prepareCall;
+  const a = installSessionTiers(h.ctx, undefined);
+  const b = installSessionTiers(h.ctx, undefined);
+  assert.equal(
+    h.llmPrototype.prepareCall.__wbTiersOriginal,
+    base,
+    "第二次安装必须剥掉本模块的旧包装，只留一层",
+  );
+  // 旧实例先卸载，新实例必须仍然可用。
+  a.api.dispose();
+  assert.notEqual(h.llmPrototype.prepareCall, base, "卸载旧实例不应把新实例一起拆掉");
+  const prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
+  assert.equal(prepared.context.contextWindow, h.baseWindow, "新实例仍应正常工作");
+  // 全部卸载后必须回到最原始的宿主方法。
+  b.api.dispose();
+  assert.equal(h.llmPrototype.prepareCall, base, "全部卸载后必须还原为宿主原方法");
+});
+
 console.log("session-tiers 真实链路测试开始");

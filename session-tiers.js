@@ -139,7 +139,28 @@ export function installSessionTiers(ctx, config) {
   const agents = read("agents");
   const llm = read("llm");
   const llmPrototype = prototypeOf(llm);
-  const originalPrepareCall = llmPrototype?.prepareCall;
+  /**
+   * 解掉本模块遗留的包装层。
+   *
+   * 为什么要这一步：同一个原型可能被多次安装（插件装成多行、fiber 重启时旧实例
+   * 还没 dispose 完、热重载）。裸着包装会互相套娃，而卸载逻辑各自只认自己的
+   * `patched` 引用，先卸载内层后外层再还原时，会把内层那个**已卸载的**包装装回去，
+   * 于是 `maxTokens` 逻辑在插件卸载后继续残留，且层数只增不减。
+   *
+   * 做法：包装函数上打一个标记，安装前沿着 `__wbTiersOriginal` 一路剥到底。
+   */
+  const unwrapOwn = (fn) => {
+    let current = fn;
+    const seen = new Set();
+    while (typeof current === "function" && current.__wbTiersWrapped === true && !seen.has(current)) {
+      seen.add(current);
+      const inner = current.__wbTiersOriginal;
+      if (typeof inner !== "function") break;
+      current = inner;
+    }
+    return current;
+  };
+  const originalPrepareCall = unwrapOwn(llmPrototype?.prepareCall);
   const canPatchPrepare = typeof originalPrepareCall === "function";
 
   /** 当前正在跑的会话；不在会话里（如后台任务）返回 undefined。 */
@@ -279,8 +300,19 @@ export function installSessionTiers(ctx, config) {
           return originalPrepareCall.call(this, callConfig, signal, configure);
         }
       };
+      // 打标记，供后续安装时识别并剥掉本模块的旧包装（见 unwrapOwn）。
+      patched.__wbTiersWrapped = true;
+      patched.__wbTiersOriginal = originalPrepareCall;
       llmPrototype.prepareCall = patched;
       return () => {
+        // 只有自己还在链顶时才还原。
+        //
+        // 不在链顶有两种情况，都不该动原型：
+        //   1. 本实例已被更晚的安装剥掉（安装时会 unwrapOwn，链上至多一层本模块包装），
+        //      此时原型上是别人的包装，拆了会把新实例一起废掉；
+        //   2. 别的插件在本模块之上又包了一层，从下面无法摘除自己。
+        // 之前这里写的是「不在链顶就 unwrapOwn 整条链」，结果先卸载旧实例会把
+        // 新实例的包装一并剥掉（测试里表现为 dispose 后原型直接回到原始方法）。
         if (llmPrototype.prepareCall === patched) llmPrototype.prepareCall = originalPrepareCall;
       };
     }, "workbuddy: session tier prepareCall");
