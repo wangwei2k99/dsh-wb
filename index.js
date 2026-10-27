@@ -211,15 +211,16 @@ function contextOverflowError(estimated, window) {
  *
  * 唯一的例外是压缩摘要请求（`purpose === "compaction"`）。DSH 自动压缩要先把
  * 「被压缩的那段历史」原样回放给模型写摘要，所以摘要请求的体积约等于整个上下文，
- * 而它预留的输出是 `compaction-basic.maxTokens`（默认 65536）。若这里照常抛错，
- * 就会出现死锁：上下文越窗 → 请求压缩 → 摘要请求也越窗 → 压缩失败 → 抛回原始错误，
- * 而这个会话此后永远无法被压缩。实测会话日志里 turn 78 / turn 111 两次压缩失败
- * 的 error 正是本函数产出的文案。
+ * 而它预留的输出是 `compaction-basic.maxTokens`（默认 65536）。旧逻辑对摘要请求
+ * 也照常收敛/拦截，于是产生两类失败，实测会话日志里 7 次压缩失败全部命中：
+ *
+ *   1. 输入已塞满窗口 → 抛 CONTEXT_WINDOW_EXCEEDED → 压缩失败并抛回原始错误，
+ *      该会话此后永远无法被压缩（日志 turn 78、turn 111）；
+ *   2. 还有一点余量 → 把 maxTokens 削到「窗口 - 输入」这个残余值，摘要写到一半
+ *      就被输出上限截断，`compaction-basic` 报 incomplete checkpoint
+ *      （日志 turn 71-75，30 万窗口下 maxTokens 被削到 4996）。
  *
  * 因此压缩请求完全不受这道检查约束，原样发出，由上游按真实容量裁决。
- *
- * 注意不能改成「把 maxTokens 降到下限后发出」：摘要本身需要完整输出，压到 1024 会
- * 直接造成摘要截断（`compaction-basic` 会报 incomplete checkpoint），等于换一种失败。
  */
 function boundContextBudget(model, context, options) {
   if (options?.purpose === COMPACTION_PURPOSE) return options;

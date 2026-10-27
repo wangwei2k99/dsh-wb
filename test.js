@@ -915,19 +915,24 @@ test("上下文超窗时按剩余空间收敛 maxTokens，塞满窗口则抛出�
   });
 
   /*
-   * 压缩摘要请求必须原样放行。
-   *
-   * DSH 做压缩时把「要被压缩的历史」原样回放给模型写摘要，所以摘要请求的体积
-   * 几乎等于整个上下文。如果这里照常抛错，上下文越窗就再也无法被压缩——压缩本身
-   * 需要先发出一次越窗请求才能完成。实测会话日志里两次压缩失败抛的都是本函数文案。
+   * 压缩摘要请求必须原样放行。实测日志里 7 次压缩失败分两类，都是本函数造成的：
+   *   turn 78 / 111 —— 输入塞满窗口，抛错后压缩失败并抛回原始错误；
+   *   turn 71-75   —— 把 maxTokens 削到「窗口 - 输入」的残余值，摘要写到一半被截断。
    */
   const compaction = { maxTokens: 65_536, purpose: "compaction" };
-  // 原样返回同一个对象：既不抛错，也不擅自压低 maxTokens。
-  // 压到 1024 会让摘要在输出上限处被截断（compaction-basic 报 incomplete checkpoint）。
+  // 输入已超出窗口：原样返回同一个对象，既不抛错也不改动 maxTokens。
   assert.strictEqual(__testing.boundContextBudget(model, over, compaction), compaction);
-  assert.throws(() => __testing.boundContextBudget(model, over, options), /context_length_exceeded/);
+  // 输入只剩少量余量（曾经会被削到 4996 那类）：同样必须保持完整输出预留，
+  // 否则摘要会在输出上限处被截断（compaction-basic 报 incomplete checkpoint）。
+  const nearFull = { messages: [{ role: "assistant", content: [{ type: "text", text: "字".repeat(195_000) }] }] };
+  assert.strictEqual(__testing.boundContextBudget(model, nearFull, compaction), compaction);
   // 普通请求仍然拦：只有压缩才有豁免，别的用途一律照旧。
+  assert.throws(() => __testing.boundContextBudget(model, over, options), /context_length_exceeded/);
   assert.throws(() => __testing.boundContextBudget(model, over, { maxTokens: 128_000, purpose: "chat" }), /context_length_exceeded/);
+  // 普通请求仍按剩余空间收敛，这条防线没有因为豁免而失效。
+  const nearModel = { ...model, contextWindow: 200_000 };
+  const clamped = __testing.boundContextBudget(nearModel, nearFull, { maxTokens: 128_000 });
+  assert.ok(clamped.maxTokens > 0 && clamped.maxTokens < 128_000, String(clamped.maxTokens));
   // 模型没配窗口时行为不变。
   assert.strictEqual(__testing.boundContextBudget({ maxTokens: 1000 }, over, compaction), compaction);
 });
