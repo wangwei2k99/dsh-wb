@@ -279,6 +279,10 @@ export function installSessionTiers(ctx, config) {
             (prepared) => {
               try {
                 if (resolution === undefined || resolution.changed !== true || prepared === null || prepared === undefined) return prepared;
+                // 在这里计数：只有真正改掉了窗口才算「生效」。
+                // 之前 applied 只在 agent/request 里加，导致 prepareCall 单独生效时
+                // stats 仍显示 applied:0，排查时容易误判成「装了但没起作用」。
+                hits.applied += 1;
                 remember(active.sessionId, {
                   contextWindow: resolution.effective,
                   maxTokens: clampCompletion(prepared?.config?.maxTokens, resolution.effective, settings),

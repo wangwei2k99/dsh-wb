@@ -73,7 +73,11 @@ test("有覆盖时窗口被改小，且输出预算随之收敛", async () => {
   // 32K 窗口放不下 32K 输出，必须收敛到窗口内且留出压缩 headroom。
   assert.ok(prepared.config.maxTokens <= 32_000, `预算不得超过窗口: ${prepared.config.maxTokens}`);
   assert.ok(prepared.config.maxTokens >= 8_000, `预算过低: ${prepared.config.maxTokens}`);
-  assert.equal(api.stats().hits.applied >= 1 || api.read("sess-A") !== null, true);
+  // 光看窗口还不够：stats 必须能反映「真的生效了」。
+  // 之前 applied 只在 agent/request 里计数，prepareCall 单独生效时恒为 0，
+  // 排查时会误以为档位没起作用。
+  assert.equal(api.stats().hits.applied, 1, "prepareCall 生效必须计入 applied");
+  assert.equal(api.stats().hits.prepareCall, 1);
 });
 
 test("覆盖不允许放大窗口", async () => {
