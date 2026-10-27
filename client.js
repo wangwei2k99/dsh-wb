@@ -2495,7 +2495,8 @@ window.__ModuleLoader__.load({
           className: "wb-cw-menu",
           role: "menu",
           "aria-label": "使用场景",
-        }, options.map((option) => createElement("button", {
+        }, [
+          ...options.map((option) => createElement("button", {
           key: option.id,
           type: "button",
           role: "menuitemradio",
@@ -2520,18 +2521,18 @@ window.__ModuleLoader__.load({
             strokeLinecap: "round",
             strokeLinejoin: "round",
           }))),
-        ])),
-        // 覆盖只作用于本会话，所以撤销入口也留在本会话的菜单里。
-        hasOverride && createElement("button", {
-          key: "reset",
-          type: "button",
-          role: "menuitem",
-          className: "wb-cw-option",
-          title: "只影响当前会话。恢复后本会话回到部署默认的窗口与输出",
-          onClick: () => { void clearOverride(); },
-        }, [
-          createElement("span", { key: "text", className: "wb-cw-option-text" }, "恢复默认"),
-        ])),
+          ])),
+          hasOverride && createElement("button", {
+            key: "reset",
+            type: "button",
+            role: "menuitem",
+            className: "wb-cw-option",
+            title: "只影响当前会话。恢复后本会话回到部署默认的窗口与输出",
+            onClick: () => { void clearOverride(); },
+          }, [
+            createElement("span", { key: "text", className: "wb-cw-option-text" }, "恢复默认"),
+          ]),
+        ]),
       ]);
     }
 

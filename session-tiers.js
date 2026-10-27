@@ -32,10 +32,9 @@ const MIN_COMPLETION_TOKENS = 256;
 const MAX_TRACKED_SESSIONS = 512;
 
 /**
- * 该会话生效的窗口。
- * 覆盖值永远不超过模型基准窗口：放大窗口属于模型/Profile 层面的能力。
+ * 写入时的上限收敛。`base` 是上游目录天花板（contextWindowMax），不是配置里的工作窗口。
  *
- * @param base 模型自身的 contextWindow
+ * @param base 上游允许的最大窗口
  * @param requested 本会话请求的窗口
  */
 export function resolveSessionWindow(base, requested) {
@@ -44,6 +43,27 @@ export function resolveSessionWindow(base, requested) {
   if (!hasRequest) return { base: hasBase ? base : undefined, effective: hasBase ? base : undefined, changed: false };
   const effective = hasBase ? Math.min(requested, base) : requested;
   return { base: hasBase ? base : undefined, effective, changed: hasBase ? effective !== base : true };
+}
+
+/**
+ * 发请求时的生效窗口。
+ * 配置里的窗口只是没选档时的默认值。覆盖在写入时已经按上游上限截过，
+ * 这里必须允许比配置窗口更大，否则输入框选了 1M，请求仍按配置里的 200K 发。
+ *
+ * @param profileWindow 模型配置上的 contextWindow
+ * @param requested 本会话已保存的窗口
+ */
+export function effectiveSessionWindow(profileWindow, requested) {
+  const hasProfile = Number.isInteger(profileWindow) && profileWindow > 0;
+  const hasRequest = Number.isInteger(requested) && requested > 0;
+  if (!hasRequest) {
+    return { base: hasProfile ? profileWindow : undefined, effective: hasProfile ? profileWindow : undefined, changed: false };
+  }
+  return {
+    base: hasProfile ? profileWindow : undefined,
+    effective: requested,
+    changed: !hasProfile || requested !== profileWindow,
+  };
 }
 
 /**
@@ -163,12 +183,26 @@ export function installSessionTiers(ctx, config) {
   const originalPrepareCall = unwrapOwn(llmPrototype?.prepareCall);
   const canPatchPrepare = typeof originalPrepareCall === "function";
 
+  /**
+   * 宿主上「会话」可能落在 agent.session.id，也可能就是 agent.id。
+   * 输入框写入用的是插槽传来的 sessionId。两条请求路径必须把这两个都试过，
+   * 否则覆盖写在一个 id 上，压缩或发请求却用另一个 id 去查，等于没生效。
+   */
+  const agentSessionKeys = (agent) => {
+    const keys = [];
+    const push = (value) => {
+      if (typeof value === "string" && value !== "" && !keys.includes(value)) keys.push(value);
+    };
+    push(agent?.session?.id);
+    push(agent?.id);
+    return keys;
+  };
+
   /** 当前正在跑的会话；不在会话里（如后台任务）返回 undefined。 */
   const currentSessionId = () => {
     try {
-      const agent = agents?.currentInitiator?.();
-      const id = agent?.session?.id ?? agent?.id;
-      return typeof id === "string" && id !== "" ? id : undefined;
+      const keys = agentSessionKeys(agents?.currentInitiator?.());
+      return keys[0];
     } catch {
       return undefined;
     }
@@ -178,6 +212,22 @@ export function installSessionTiers(ctx, config) {
     if (sessionId === undefined) return undefined;
     const requested = overrides.get(sessionId);
     return requested === undefined ? undefined : { sessionId, requested };
+  };
+
+  const overrideFor = (agent) => {
+    for (const id of agentSessionKeys(agent)) {
+      const found = overrideOf(id);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+
+  const activeOverride = () => {
+    try {
+      return overrideFor(agents?.currentInitiator?.());
+    } catch {
+      return undefined;
+    }
   };
 
   const remember = (sessionId, entry) => {
@@ -222,8 +272,7 @@ export function installSessionTiers(ctx, config) {
       const config = await next();
       try {
         hits.agentRequest += 1;
-        const sessionId = payload?.agent?.id;
-        const active = overrideOf(typeof sessionId === "string" && sessionId !== "" ? sessionId : undefined);
+        const active = overrideFor(payload?.agent) ?? activeOverride();
         if (active === undefined || config === null || typeof config !== "object") return config;
         // 窗口信息要等 prepareCall 才拿得到；这里先按本会话窗口收紧输出预留，
         // 保证 request/header 与压缩策略看到的预算和覆盖窗口自洽。
@@ -255,13 +304,13 @@ export function installSessionTiers(ctx, config) {
        */
       const patched = function prepareCallWithSessionTier(callConfig, signal, configure) {
         try {
-          const active = overrideOf(currentSessionId());
+          const active = activeOverride();
           if (active === undefined) return originalPrepareCall.call(this, callConfig, signal, configure);
           hits.prepareCall += 1;
           let resolution;
           const configureCall = (controls, modelInfo) => {
             try {
-              resolution = resolveSessionWindow(modelInfo?.context?.contextWindow, active.requested.contextWindow);
+              resolution = effectiveSessionWindow(modelInfo?.context?.contextWindow, active.requested.contextWindow);
               const seeded = typeof configure === "function" ? configure(controls, modelInfo) : controls;
               if (resolution.changed !== true) return seeded;
               const maxTokens = clampCompletion(
@@ -387,15 +436,9 @@ export function installSessionTiers(ctx, config) {
         return { ok: false, error: "maxTokens must not exceed contextWindow" };
       }
       /*
-       * 按模型基准窗口收敛，而不是原样存。
-       *
-       * 这里曾经只校验「是正整数」，把 1M 原样存下来：界面上菜单显示 1M，
-       * 实际每次请求都被 resolveSessionWindow 压回模型的 300K，用户看到的是
-       * 「选了 1M 还报 300K 超窗」。属于静默失效——接口成功、显示成功、
-       * 实际不生效，比直接报错更难查。
-       *
-       * 基准窗口由调用方随请求带上（前端已从 /context-window 的
-       * contextWindowMax 拿到）。拿不到就不收敛，保持原有行为。
+       * 只按上游目录上限收敛。配置里的工作窗口（例如日常编码 200K）不是天花板，
+       * 本会话可以选到比它更大的档。天花板由调用方随请求带上
+       * （前端从 /context-window 的 contextWindowMax 拿到）。拿不到就不收敛。
        */
       const base = Number.isInteger(tier.contextWindowMax) && tier.contextWindowMax > 0
         ? tier.contextWindowMax

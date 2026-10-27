@@ -25,6 +25,7 @@ import {
 import { authenticationMode, installWorkBuddyWeb, __testing as webTesting } from "./workbuddy-web.js";
 import { __testing as creditsTesting, fetchWorkBuddyCredits } from "./workbuddy-credits.js";
 import { probeEndpoint } from "./workbuddy-discovery.js";
+import { effectiveSessionWindow, resolveSessionWindow } from "./session-tiers.js";
 
 test("插件展示元信息由 locale 提供，且经 exports 暴露给 DSH 读取", () => {
   const readJson = (name) => JSON.parse(readFileSync(new URL(name, import.meta.url), "utf8"));
@@ -399,8 +400,21 @@ test("会话级档位只动内存，按 sessionId 隔离", () => {
   // 窗口必须与完成预留自洽，否则压缩会抛「没有消息预算」。
   assert.match(tiers, /export function clampCompletion/);
   assert.match(tiers, /export function resolveSessionWindow/);
-  // 覆盖不超过模型基准窗口：放大窗口不属于会话层能力。
+  // 写入时按上游上限收敛。发请求时用已保存的会话窗口，允许大于配置里的默认窗口。
   assert.match(tiers, /Math\.min\(requested, base\)/);
+  assert.match(tiers, /effectiveSessionWindow\(modelInfo\?\.context\?\.contextWindow/);
+  assert.match(tiers, /agent\?\.session\?\.id/);
+  assert.match(tiers, /agent\?\.id/);
+});
+
+test("会话窗口可以大于配置默认值，写入仍不超过上游上限", () => {
+  const raised = effectiveSessionWindow(200_000, 1_000_000);
+  assert.equal(raised.effective, 1_000_000);
+  assert.equal(raised.changed, true);
+  const unchanged = effectiveSessionWindow(200_000, 200_000);
+  assert.equal(unchanged.changed, false);
+  assert.equal(unchanged.effective, 200_000);
+  assert.equal(resolveSessionWindow(1_000_000, 2_000_000).effective, 1_000_000);
 });
 
 test("清除会话档位必须显式传 null，缺字段不能当清除", () => {

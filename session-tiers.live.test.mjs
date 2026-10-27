@@ -82,13 +82,30 @@ test("有覆盖时窗口被改小，且输出预算随之收敛", async () => {
   assert.equal(api.stats().hits.prepareCall, 1);
 });
 
-test("覆盖不允许放大窗口", async () => {
+test("本会话窗口可以大于配置里的默认窗口", async () => {
+  /*
+   * 配置里的 contextWindow 只是「没选档时的默认值」，不是天花板。
+   * 以前这里会把它当天花板、把 1M 压回 200K，于是界面选了 1M 仍按 200K 发请求，
+   * 用户看到的是「选了 1M 还报 200K 超窗」——接口成功、显示成功、实际不生效。
+   * 天花板现在只取上游目录的 contextWindowMax（由 write 随请求带上）。
+   */
   const h = host({ baseWindow: 200_000, baseMaxTokens: 32_000 });
   const { api } = installSessionTiers(h.ctx, undefined);
   api.write("sess-A", { contextWindow: 1_000_000 });
 
   const prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
-  assert.equal(prepared.context.contextWindow, 200_000, "不得把窗口放大到超过模型上限");
+  assert.equal(prepared.context.contextWindow, 1_000_000, "会话选了 1M 就必须按 1M 发请求");
+});
+
+test("写入时按上游目录上限收敛，超过上限会被压下并提示", async () => {
+  const h = host({ baseWindow: 200_000, baseMaxTokens: 32_000 });
+  const { api } = installSessionTiers(h.ctx, undefined);
+  // contextWindowMax 是上游目录天花板，写 2M 必须收敛到 1M 而不是照单全收。
+  const result = api.write("sess-A", { contextWindow: 2_000_000, contextWindowMax: 1_000_000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.clamped, true, "超过上游上限必须标记 clamped");
+  assert.equal(result.requestedContextWindow, 2_000_000);
+  assert.equal(result.override.contextWindow, 1_000_000);
 });
 
 test("两个会话各自独立，互不影响", async () => {
