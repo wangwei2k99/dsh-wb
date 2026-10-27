@@ -288,8 +288,24 @@ export function installSessionTiers(ctx, config) {
                   maxTokens: clampCompletion(prepared?.config?.maxTokens, resolution.effective, settings),
                 });
                 if (prepared.context === undefined || prepared.context === null) return prepared;
+                /*
+                 * 除了 context.contextWindow，还要同步 prepared.model.contextWindow。
+                 *
+                 * 两者是不同消费者的入参：
+                 *   - `context.contextWindow` → 宿主的 request/context 事件、token 计量、压缩阈值
+                 *   - `model.contextWindow`   → 适配器自己（`boundContextBudget` 用它判断
+                 *                               「输入 + 输出放不放得下」，溢出报错文案里的
+                 *                               「模型窗口 N token」也取自这里）
+                 *
+                 * 只改前者会得到一个割裂的状态：DSH 按 1M 排压缩，适配器却按模型定义的
+                 * 300K 判溢出，于是用户明明选了 1M，仍然收到「模型窗口 300000 token」。
+                 */
+                const nextModel = prepared.model && typeof prepared.model === "object"
+                  ? Object.freeze({ ...prepared.model, contextWindow: resolution.effective })
+                  : prepared.model;
                 return Object.freeze({
                   ...prepared,
+                  ...(nextModel === undefined ? {} : { model: nextModel }),
                   context: Object.freeze({ ...prepared.context, contextWindow: resolution.effective }),
                 });
               } catch {
@@ -370,6 +386,27 @@ export function installSessionTiers(ctx, config) {
       if (next.maxTokens !== undefined && next.maxTokens > next.contextWindow) {
         return { ok: false, error: "maxTokens must not exceed contextWindow" };
       }
+      /*
+       * 按模型基准窗口收敛，而不是原样存。
+       *
+       * 这里曾经只校验「是正整数」，把 1M 原样存下来：界面上菜单显示 1M，
+       * 实际每次请求都被 resolveSessionWindow 压回模型的 300K，用户看到的是
+       * 「选了 1M 还报 300K 超窗」。属于静默失效——接口成功、显示成功、
+       * 实际不生效，比直接报错更难查。
+       *
+       * 基准窗口由调用方随请求带上（前端已从 /context-window 的
+       * contextWindowMax 拿到）。拿不到就不收敛，保持原有行为。
+       */
+      const base = Number.isInteger(tier.contextWindowMax) && tier.contextWindowMax > 0
+        ? tier.contextWindowMax
+        : undefined;
+      const resolvedWindow = resolveSessionWindow(base, next.contextWindow);
+      const effectiveWindow = resolvedWindow.effective ?? next.contextWindow;
+      const clamped = effectiveWindow !== next.contextWindow;
+      next.contextWindow = effectiveWindow;
+      if (next.maxTokens !== undefined) {
+        next.maxTokens = Math.min(next.maxTokens, effectiveWindow);
+      }
       overrides.set(id, next);
       // 覆盖值变了，之前推导出的预算不再成立，等下次请求重新解析。
       resolved.delete(id);
@@ -378,7 +415,17 @@ export function installSessionTiers(ctx, config) {
         if (oldest.done === true) break;
         overrides.delete(oldest.value);
       }
-      return { ok: true, sessionId: id, override: next, resolved: null };
+      return {
+        ok: true,
+        sessionId: id,
+        override: next,
+        resolved: null,
+        // clamped 为 true 表示请求值被模型上限压过，调用方应据此提示用户，
+        // 而不是让界面继续显示一个永远不会生效的更大数字。
+        clamped,
+        requestedContextWindow: clamped ? tier.contextWindow : undefined,
+        contextWindowMax: base,
+      };
     },
     /** 诊断用计数。 */
     stats() {

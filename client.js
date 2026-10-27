@@ -2356,12 +2356,25 @@ window.__ModuleLoader__.load({
         setTokens(budget.maxTokens);
         try {
           // 写会话级覆盖：只影响本会话，不动 profile 配置，也不影响别的会话。
-          await authRequest("session-tier", {
+          //
+          // contextWindowMax 必须一起传：服务端据此把请求值收敛到模型真实上限。
+          // 不传的话它会原样存下 1M，而实际请求永远被压回 300K ——
+          // 界面上显示 1M、却一直报 300K 超窗，就是这么来的。
+          const result = await authRequest("session-tier", {
             sessionId,
             contextWindow: budget.contextWindow,
             maxTokens: budget.maxTokens,
             model: modelId,
+            contextWindowMax: Number.isSafeInteger(ceiling) && ceiling > 0 ? ceiling : undefined,
           });
+          // 服务端压过了就以服务端为准，别让界面继续显示一个不会生效的数字。
+          const appliedWindow = result?.override?.contextWindow;
+          const appliedTokens = result?.override?.maxTokens;
+          if (typeof appliedWindow === "number") setValue(appliedWindow);
+          if (typeof appliedTokens === "number") setTokens(appliedTokens);
+          if (result?.clamped === true) {
+            setError(`该模型上下文上限为 ${formatTokenTier(result.contextWindowMax ?? appliedWindow)}，已按上限设置`);
+          }
           if (typeof window !== "undefined") window.dispatchEvent(new Event(AUTH_STATE_EVENT));
           setHasOverride(true);
         } catch (cause) {

@@ -29,6 +29,8 @@ function host({ baseWindow = 1_000_000, baseMaxTokens = 128_000 } = {}) {
         const controls = typeof configure === "function" ? configure({ ...config }, info) : { ...config };
         const maxTokens = controls.maxTokens ?? info.defaultMaxTokens;
         return Object.freeze({
+          // 真实 prepared 带 model，适配器用它判溢出，这里必须照做。
+          model: Object.freeze({ id: config.model, contextWindow: info.context.contextWindow }),
           config: Object.freeze({ ...controls, maxTokens }),
           context: Object.freeze({ ...info.context }),
         });
@@ -164,6 +166,40 @@ test("非法覆盖被拒绝，不会写入脏数据", async () => {
   const missing = api.write("sess-A", { maxTokens: 1000 });
   assert.equal(missing.ok, false, "缺窗口必须被拒");
   assert.equal(api.read("sess-A").override, null, "拒绝后不得留下覆盖");
+});
+
+test("超过模型上限的覆盖按上限存下，并如实标记 clamped", () => {
+  // 曾经的 bug：write 只校验「是正整数」，把 1M 原样存下。
+  // 界面菜单显示 1M，每次请求却被压回模型的 300K，用户看到的是
+  // 「选了 1M 还报 300K 超窗」。静默失效比直接报错更难查。
+  const h = host({ baseWindow: 300_000 });
+  const { api } = installSessionTiers(h.ctx, undefined);
+  const result = api.write("sess-A", {
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    contextWindowMax: 300_000,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.clamped, true, "被上限压过必须标记出来");
+  assert.equal(result.override.contextWindow, 300_000, "存的必须是真正生效的值");
+  assert.equal(result.requestedContextWindow, 1_000_000, "保留原始请求值以便提示");
+  assert.equal(result.override.maxTokens, 128_000, "输出仍在窗口内则保留");
+});
+
+test("模型窗口与 context 窗口同步，适配器不会按旧窗口判溢出", async () => {
+  // 只改 context.contextWindow 会割裂状态：宿主按新窗口排压缩，
+  // 适配器 boundContextBudget 却按 model.contextWindow 判溢出，
+  // 于是报了「模型窗口 300000 token」这种前后矛盾的话。
+  const h = host();
+  const { api } = installSessionTiers(h.ctx, undefined);
+  api.write("sess-A", { contextWindow: 100_000 });
+  const prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
+  assert.equal(prepared.context.contextWindow, 100_000);
+  assert.equal(
+    prepared.model.contextWindow,
+    prepared.context.contextWindow,
+    "model.contextWindow 必须跟着一起改，否则适配器判溢出用的是旧值",
+  );
 });
 
 test("agent/request 内部出错时原样放行，不拖垮请求", async () => {
