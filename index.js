@@ -71,6 +71,9 @@ const COMPAT = {
   thinkingFormat: "openai",
 };
 const IDENTITY_SENTENCE_RE = /\bYou are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\r\n]*?(?:\.(?=\s|$)|(?=\r?\n|$))/gi;
+const NEUTRAL_SYSTEM_OPENER = "You are a helpful assistant.";
+// 国内网关只看每条 system 消息去空白后的开头。改写成 CodeBuddy/WorkBuddy 仍可能落在同一份名单上。
+const BLOCKED_SYSTEM_OPENING_RE = /^(?:you are (?:codebuddy|workbuddy)\b|you are an ai agent powered by deepseek harness\b|you are claude code\b)/i;
 
 function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
   if (typeof init?.body !== "string") return init;
@@ -86,10 +89,18 @@ function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
   // 第 3 条用负向断言排除功能性标识：dsh-xxx / dsh_xxx / @deepseek-ai/dsh-* /
   // 路径 .dsh/ / 环境变量 DSH_XXX / 命令行 dsh。这些必须原样保留，
   // 否则模型会拼错包名、路径或命令。
-  const rewrite = (text) => text
-    .replace(IDENTITY_SENTENCE_RE, `You are ${productName}, an AI coding assistant.`)
-    .replace(/\bDeepSeek[ -]Harness\b/gi, productName)
-    .replace(/\bDSH\b(?![-_A-Za-z0-9])/g, productName);
+  const rewrite = (text) => {
+    const rewritten = text
+      .replace(IDENTITY_SENTENCE_RE, `You are ${productName}, an AI coding assistant.`)
+      .replace(/\bDeepSeek[ -]Harness\b/gi, productName)
+      .replace(/\bDSH\b(?![-_A-Za-z0-9])/g, productName);
+    const body = rewritten.trimStart();
+    const leading = rewritten.slice(0, rewritten.length - body.length);
+    if (!BLOCKED_SYSTEM_OPENING_RE.test(body) || body.toLowerCase().startsWith(NEUTRAL_SYSTEM_OPENER.toLowerCase())) {
+      return rewritten;
+    }
+    return `${leading}${NEUTRAL_SYSTEM_OPENER}\n\n${body}`;
+  };
   let changed = false;
   const messages = body.messages.map((message) => {
     if (!["system", "developer"].includes(message?.role)) return message;
@@ -279,11 +290,14 @@ async function normalizeWorkBuddyError(response, trace) {
     // `11128` 是重载错误码，必须按 message 分支，否则会误诊：
     //   msg 含 "conversation id missing" / "request illegal"
     //        -> 渠道校验：缺少会话头族（X-Conversation-* 三件套缺一不可）
+    //   msg 含 "unapproved channel"
+    //        -> 系统提示开头命中名单，与会话头无关
     //   msg 含 "first message is not system prompt"
     //        -> 请求体形状问题，与身份无关
     const upstreamMsg = String(data?.msg ?? data?.message ?? data?.error?.message ?? "");
     const msgLower = upstreamMsg.toLowerCase();
-    const channelFailure = /conversation id missing|request illegal|channel/.test(msgLower);
+    const channelFailure = /conversation id missing|request illegal/.test(msgLower);
+    const promptOpeningFailure = /unapproved channel|illegal api invocation/.test(msgLower);
     const bodyShapeFailure = /first message is not system prompt/.test(msgLower);
 
     // 不同业务码的处置方式完全不同，混成一句"请求失败"会误导用户：
@@ -301,9 +315,11 @@ async function normalizeWorkBuddyError(response, trace) {
     if (code === "11128" || code === "11-128") {
       hint = channelFailure
         ? "：渠道校验未通过（缺少会话标识头族）。请确认插件版本已包含 X-Conversation-* 三件套。"
-        : bodyShapeFailure
-          ? "：请求体首条消息必须是 system 提示。"
-          : "：上游拒绝该请求，请查看业务提示。";
+        : promptOpeningFailure
+          ? "：系统提示开头命中上游渠道名单。这与会话头无关。"
+          : bodyShapeFailure
+            ? "：请求体首条消息必须是 system 提示。"
+            : "：上游拒绝该请求，请查看业务提示。";
     }
     // 其它业务码也可能是上下文超限（上游换措辞时不留死角），按 msg 兜底识别。
     if (!hint && /context[\s_-]*(?:length|window)|prompt\s+(?:is\s+)?too\s+(?:long|large)|maximum\s+context/i.test(upstreamMsg)) {

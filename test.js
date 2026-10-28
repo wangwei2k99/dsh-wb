@@ -809,9 +809,9 @@ test("WorkBuddy 出站身份句只改写系统指令，保留用户、工具和�
   assert.strictEqual(await options.fetch("https://copilot.tencent.com/v2/chat/completions", init), response);
   const actual = JSON.parse(sent.body);
   const expected = structuredClone(body);
-  expected.messages[0].content = `You are CodeBuddy, an AI coding assistant.\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
-  expected.messages[1].content[0].text = "You are CodeBuddy, an AI coding assistant.";
-  expected.messages[1].content[1].text = "You are CodeBuddy, an AI coding assistant.\n保留工具说明。";
+  expected.messages[0].content = `You are a helpful assistant.\n\nYou are CodeBuddy, an AI coding assistant.\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
+  expected.messages[1].content[0].text = "You are a helpful assistant.\n\nYou are CodeBuddy, an AI coding assistant.";
+  expected.messages[1].content[1].text = "You are a helpful assistant.\n\nYou are CodeBuddy, an AI coding assistant.\n保留工具说明。";
   assert.deepEqual(actual, expected);
   assert.equal(init.body, JSON.stringify(body));
   assert.equal(new Headers(sent.headers).get("authorization"), "Bearer test-key");
@@ -898,6 +898,13 @@ test("WorkBuddy 上游业务码可见，错误正文不会泄露，成功响应�
   const channelText = await __testing.workBuddyRequestOptions({ fetch: async () => channel })
     .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
   assert.match(channelText, /渠道校验/);
+  assert.match(channelText, /X-Conversation/);
+
+  const opening = Response.json({ code: 11128, msg: "Illegal API invocation from an unapproved channel" }, { status: 400 });
+  const openingText = await __testing.workBuddyRequestOptions({ fetch: async () => opening })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.match(openingText, /系统提示开头/);
+  assert.doesNotMatch(openingText, /缺少会话标识头族/);
 
   const shape = Response.json({ code: 11128, msg: "first message is not system prompt" }, { status: 400 });
   const shapeText = await __testing.workBuddyRequestOptions({ fetch: async () => shape })
