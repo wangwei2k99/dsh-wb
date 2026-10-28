@@ -215,7 +215,7 @@ test("桌面端 prepared stream 能发送文本并收到首个模型输出", asy
     assert.equal(new Headers(options.headers).get("x-ide-name"), "CodeBuddy");
     const body = JSON.parse(options.body);
     if (expectedSystem) {
-      assert.ok(body.messages.some(message => message.role === "system" && message.content.startsWith("Follow the instructions below.")));
+      assert.ok(body.messages.some(message => message.role === "system" && message.content.startsWith("You are a helpful assistant.")));
     }
     if (expectedTools) assert.equal(body.tools.length, expectedTools.length);
     for (const message of body.messages.filter((entry) => ["system", "developer"].includes(entry.role))) {
@@ -809,9 +809,9 @@ test("WorkBuddy 出站身份句只改写系统指令，保留用户、工具和�
   assert.strictEqual(await options.fetch("https://copilot.tencent.com/v2/chat/completions", init), response);
   const actual = JSON.parse(sent.body);
   const expected = structuredClone(body);
-  expected.messages[0].content = `Follow the instructions below.\n\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
-  expected.messages[1].content[0].text = "Follow the instructions below.";
-  expected.messages[1].content[1].text = "Follow the instructions below.\n\n保留工具说明。";
+  expected.messages[0].content = `You are a helpful assistant.\n\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
+  expected.messages[1].content[0].text = "You are a helpful assistant.";
+  expected.messages[1].content[1].text = "You are a helpful assistant.\n\n保留工具说明。";
   expected.messages[3].content = "You are an AI coding assistant.";
   assert.deepEqual(actual, expected);
   assert.equal(init.body, JSON.stringify(body));
@@ -841,10 +841,10 @@ test("WorkBuddy uses CodeBuddy runtime branding only in instruction roles", asyn
   } });
   await options.fetch("https://copilot.tencent.com/v2/chat/completions", { body: original });
   const expected = structuredClone(body);
-  const surfaced = `Follow the instructions below.\n\nThe user is interacting through the ${branded.replaceAll("DeepSeek Harness", "CodeBuddy").replace(/^You are interacting with the user through the /, "")}`;
+  const surfaced = `You are a helpful assistant.\n\nThe user is interacting through the ${branded.replaceAll("DeepSeek Harness", "CodeBuddy").replace(/^You are interacting with the user through the /, "")}`;
   expected.messages[0].content = surfaced;
   expected.messages[1].content[0].text = surfaced;
-  expected.messages[1].content[1].text = "Follow the instructions below.\n\n保留权限、工作目录和工具规则。";
+  expected.messages[1].content[1].text = "You are a helpful assistant.\n\n保留权限、工作目录和工具规则。";
   assert.deepEqual(JSON.parse(sent.body), expected);
   assert.equal(JSON.stringify(body), original);
   assert.equal(blocks[0].text, branded);

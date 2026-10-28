@@ -71,8 +71,9 @@ const COMPAT = {
   thinkingFormat: "openai",
 };
 const IDENTITY_SENTENCE_RE = /\bYou are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\r\n]*?(?:\.(?=\s|$)|(?=\r?\n|$))/gi;
-// 不以 "You are" 开头。国内网关按 system 消息开头匹配第三方身份句，"You are a helpful assistant." 也已经被用过。
-const NEUTRAL_SYSTEM_OPENER = "Follow the instructions below.";
+// 国内网关实测：system 以这句开头可以通过，紧随其后的原文身份句也可以留在后面。
+// 不以 "You are" 开头的占位句（例如 Follow the instructions below.）仍会 11128。
+const NEUTRAL_SYSTEM_OPENER = "You are a helpful assistant.";
 const ASSISTANT_OPENING_REPLACEMENT = "You are an AI coding assistant.";
 const BLOCKED_OPENING_LINE_RE = /^(?:you are an ai agent powered by deepseek harness\b|you are claude code\b)/i;
 
