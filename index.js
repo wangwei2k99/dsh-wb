@@ -11,6 +11,7 @@ import * as anthropicMessagesApi from "@earendil-works/pi-ai/api/anthropic-messa
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
   codeBuddyHeaders,
+  conversationHeaders,
   IDENTITY_CLI,
   IDENTITY_WORKBUDDY,
   normalizeIdentity,
@@ -324,37 +325,61 @@ async function normalizeWorkBuddyError(response, trace) {
   }
 }
 
-function workBuddyRequestOptions(options) {
-  const trace = traceContext.getStore();
+function chatIdentityHeaders(trace, existing) {
+  const headerOptions = {
+    userId: trace?.workBuddyUserId,
+    conversationKey: trace?.sessionId,
+  };
+  // 身份在 resolveApiKey 之后才写进上下文。发请求时再读，
+  // 避免选项创建时还是 CLI、令牌身份的会话头因此整组丢失。
   const identity = trace?.identity ?? IDENTITY_CLI;
+  const generated = identity === IDENTITY_WORKBUDDY
+    ? workBuddyIdentityHeaders(headerOptions)
+    : conversationHeaders(headerOptions);
+  return { identity, identityHeaders: adoptConversationHeaders(generated, existing) };
+}
+
+function adoptConversationHeaders(generated, existing) {
+  const present = existing ? new Headers(existing) : undefined;
+  if (!present) return generated;
+  const out = { ...generated };
+  const keep = (key) => {
+    const value = present.get(key);
+    if (value) out[key] = value;
+  };
+  keep("x-conversation-id");
+  const turn = present.get("x-conversation-request-id") || present.get("x-root-request-id");
+  if (turn) {
+    out["x-conversation-request-id"] = present.get("x-conversation-request-id") || turn;
+    out["x-root-request-id"] = present.get("x-root-request-id") || turn;
+  }
+  const message = present.get("x-conversation-message-id") || present.get("x-request-id");
+  if (message) {
+    out["x-conversation-message-id"] = present.get("x-conversation-message-id") || message;
+    out["x-request-id"] = present.get("x-request-id") || message;
+  }
+  for (const key of Object.keys(generated)) keep(key);
+  return out;
+}
+
+function workBuddyRequestOptions(options) {
   const fetchImpl = options?.fetch ?? globalThis.fetch;
-  // WorkBuddy 身份需要实体身份头（账号与会话），按请求上下文派生。
-  const identityHeaders = identity === IDENTITY_WORKBUDDY
-    ? workBuddyIdentityHeaders({
-      userId: trace?.workBuddyUserId,
-      conversationKey: trace?.sessionId,
-    })
-    : undefined;
-  const identityOptions = { identityHeaders };
-  // 身份头只计算一次：它由「静态 profile + 动态会话头」合并而成，
-  // 同一请求内两者都不变，无需在每次 fetch 时重建（new Headers + Object.fromEntries
-  // 都是逐条遍历，流式请求里每个回合都会走一遍）。
-  const baseHeaders = codeBuddyHeaders(options?.headers, identity, identityOptions);
+  const initial = chatIdentityHeaders(traceContext.getStore());
+  const baseHeaders = codeBuddyHeaders(options?.headers, initial.identity, { identityHeaders: initial.identityHeaders });
   return {
     ...options,
     timeoutMs: options?.timeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
     headers: baseHeaders,
     fetch: async (input, init) => {
+      const trace = traceContext.getStore();
       const started = Date.now();
       traceEvent(trace, "http.start");
       try {
+        const identity = trace?.identity ?? IDENTITY_CLI;
         const prepared = sanitizeWorkBuddyRequest(init, identity);
-        // sanitize 只改 body，会原样保留 init.headers。因此只要调用方没在
-        // init 里另带头（或带的就是进 options 的那份），身份头结果就是同一个。
-        const callerHeaders = prepared?.headers;
-        const merged = callerHeaders === undefined || callerHeaders === options?.headers
-          ? baseHeaders
-          : codeBuddyHeaders(callerHeaders, identity, identityOptions);
+        const callerHeaders = prepared?.headers === undefined ? options?.headers : prepared.headers;
+        const { identityHeaders } = chatIdentityHeaders(trace, callerHeaders);
+        const merged = codeBuddyHeaders(callerHeaders, identity, { identityHeaders });
         const response = await fetchImpl(input, { ...prepared, headers: merged });
         traceEvent(trace, "http.headers", { elapsedMs: Date.now() - started, status: response.status });
         return await normalizeWorkBuddyError(response, trace);

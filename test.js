@@ -763,6 +763,11 @@ test("CodeBuddy identity wins at the final HTTP boundary without changing creden
     assert.equal(headers.get("authorization"), "Bearer private");
     assert.equal(headers.get("x-api-key"), null);
     assert.equal(headers.get("existing"), "value");
+    assert.match(headers.get("x-conversation-id"), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.match(headers.get("x-conversation-request-id"), /^[0-9a-f]{32}$/);
+    assert.equal(headers.get("x-root-request-id"), headers.get("x-conversation-request-id"));
+    assert.match(headers.get("x-conversation-message-id"), /^[0-9a-f]{32}$/);
+    assert.equal(headers.get("x-request-id"), headers.get("x-conversation-message-id"));
     assert(![...headers.keys()].some(key => key.startsWith("x-stainless-")));
     assert.deepEqual([...new Headers(original)], before);
   }

@@ -143,6 +143,31 @@ function traceHeaders() {
 }
 
 /**
+ * 会话头族。上游渠道校验要求这三项同时存在，缺任意一项都是 400 / 11128。
+ * API Key（CLI 身份）和令牌登录都要带，不能只加在桌面端身份上。
+ *
+ * @param {object} [options]
+ * @param {string} [options.userId] 参与派生稳定会话 ID
+ * @param {string} [options.conversationKey] 同一会话多轮复用同一个会话 ID
+ */
+export function conversationHeaders(options = {}) {
+  const userId = String(options.userId ?? "").trim() || "anonymous";
+  const conversation = options.conversationKey
+    ? stableConversationId(userId, options.conversationKey)
+    : conversationId();
+  const message = messageId();
+  // 一轮 user send 内 X-Conversation-Request-ID 与 X-Root-Request-ID 同值。
+  const turnRequest = messageId();
+  return {
+    "x-conversation-id": conversation,
+    "x-conversation-request-id": turnRequest,
+    "x-root-request-id": turnRequest,
+    "x-conversation-message-id": message,
+    "x-request-id": message,
+  };
+}
+
+/**
  * 构造 WorkBuddy 桌面端身份头。
  *
  * 覆盖官方 `build_identity_headers(PRODUCT_DESKTOP)` 的完整头集，除静态头外
@@ -155,20 +180,9 @@ function traceHeaders() {
  */
 export function workBuddyIdentityHeaders(options = {}) {
   const userId = String(options.userId ?? "").trim() || "anonymous";
-  const conversation = options.conversationKey
-    ? stableConversationId(userId, options.conversationKey)
-    : conversationId();
-  const message = messageId();
-  // 一轮 user send 内 X-Conversation-Request-ID 与 X-Root-Request-ID 同值，
-  // 且早于消息 id 生成。
-  const turnRequest = messageId();
   return {
     "x-user-id": userId,
-    "x-conversation-id": conversation,
-    "x-conversation-request-id": turnRequest,
-    "x-root-request-id": turnRequest,
-    "x-conversation-message-id": message,
-    "x-request-id": message,
+    ...conversationHeaders({ ...options, userId }),
     ...traceHeaders(),
   };
 }
@@ -198,8 +212,8 @@ export function normalizeIdentity(value) {
 /**
  * 合并出站身份头。
  *
- * CLI 身份只覆盖静态头；WorkBuddy 身份除静态头外，还会合并会话头族与链路头族。
- * `identityHeaders` 允许调用方传入已构造好的动态头（同一轮请求复用同一批 ID）。
+ * CLI 与 WorkBuddy 都覆盖各自的静态头。调用方传入 `identityHeaders` 时两边都会合并
+ * （聊天请求用它带上会话头族）。未传入时只有 WorkBuddy 身份自动补会话头与链路头。
  *
  * @param {HeadersInit} [input] 已有请求头
  * @param {string} [identity] IDENTITY_CLI 或 IDENTITY_WORKBUDDY
@@ -214,8 +228,8 @@ export function codeBuddyHeaders(input, identity = IDENTITY_CLI, options = {}) {
   const isWorkBuddy = normalizeIdentity(identity) === IDENTITY_WORKBUDDY;
   const profile = isWorkBuddy ? IDENTITY_WORKBUDDY_HEADERS : IDENTITY_CLI_HEADERS;
   for (const [key, value] of Object.entries(profile)) headers.set(key, value);
-  if (isWorkBuddy) {
-    const dynamic = options.identityHeaders ?? workBuddyIdentityHeaders(options);
+  const dynamic = options.identityHeaders ?? (isWorkBuddy ? workBuddyIdentityHeaders(options) : undefined);
+  if (dynamic) {
     for (const [key, value] of Object.entries(dynamic)) headers.set(key, value);
   }
   return Object.fromEntries(headers);
