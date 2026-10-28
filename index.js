@@ -73,11 +73,31 @@ const COMPAT = {
 const IDENTITY_SENTENCE_RE = /\bYou are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\r\n]*?(?:\.(?=\s|$)|(?=\r?\n|$))/gi;
 // 不以 "You are" 开头。国内网关按 system 消息开头匹配第三方身份句，"You are a helpful assistant." 也已经被用过。
 const NEUTRAL_SYSTEM_OPENER = "Follow the instructions below.";
+const ASSISTANT_OPENING_REPLACEMENT = "You are an AI coding assistant.";
+const BLOCKED_OPENING_LINE_RE = /^(?:you are an ai agent powered by deepseek harness\b|you are claude code\b)/i;
+
+function requestBodyText(body) {
+  if (typeof body === "string") return body;
+  if (body instanceof Uint8Array) return Buffer.from(body).toString("utf8");
+  return undefined;
+}
+
+function rewriteAssistantOpening(text) {
+  let changed = false;
+  const lines = text.split("\n").map((line) => {
+    const indent = line.match(/^\s*/)[0];
+    if (!BLOCKED_OPENING_LINE_RE.test(line.slice(indent.length))) return line;
+    changed = true;
+    return indent + ASSISTANT_OPENING_REPLACEMENT;
+  });
+  return changed ? lines.join("\n") : text;
+}
 
 function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
-  if (typeof init?.body !== "string") return init;
+  const rawBody = requestBodyText(init?.body);
+  if (rawBody === undefined) return init;
   let body;
-  try { body = JSON.parse(init.body); } catch { return init; }
+  try { body = JSON.parse(rawBody); } catch { return init; }
   if (!Array.isArray(body?.messages)) return init;
   // 自称跟随出站身份：令牌登录模拟 WorkBuddy 桌面端，API Key 模式沿用 CodeBuddy。
   const productName = normalizeIdentity(identity) === IDENTITY_WORKBUDDY ? "WorkBuddy" : "CodeBuddy";
@@ -101,13 +121,14 @@ function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
   };
   let changed = false;
   const messages = body.messages.map((message) => {
-    if (!["system", "developer"].includes(message?.role)) return message;
+    if (!["system", "developer", "assistant"].includes(message?.role)) return message;
+    const rewriteContent = message.role === "assistant" ? rewriteAssistantOpening : rewrite;
     let content = message.content;
-    if (typeof content === "string") content = rewrite(content);
+    if (typeof content === "string") content = rewriteContent(content);
     else if (Array.isArray(content)) {
       const parts = content.map((part) => {
-        if (part?.type !== "text" || typeof part.text !== "string") return part;
-        const text = rewrite(part.text);
+        if (typeof part?.text !== "string") return part;
+        const text = rewriteContent(part.text);
         return text === part.text ? part : { ...part, text };
       });
       if (parts.some((part, index) => part !== content[index])) content = parts;
@@ -265,7 +286,7 @@ function silentContextOverflow(message, options) {
     && textLength <= SILENT_OVERFLOW_MAX_TEXT;
 }
 
-async function normalizeWorkBuddyError(response, trace) {
+async function normalizeWorkBuddyError(response, trace, detail = "") {
   if (response.ok || !response.body) return response;
   const reader = response.clone().body.getReader();
   try {
@@ -314,7 +335,7 @@ async function normalizeWorkBuddyError(response, trace) {
       hint = channelFailure
         ? "：渠道校验未通过（缺少会话标识头族）。请确认插件版本已包含 X-Conversation-* 三件套。"
         : promptOpeningFailure
-          ? "：系统提示开头命中上游渠道名单。这与会话头无关。"
+          ? `：系统提示开头命中上游渠道名单。这与会话头无关。${detail}`
           : bodyShapeFailure
             ? "：请求体首条消息必须是 system 提示。"
             : "：上游拒绝该请求，请查看业务提示。";
@@ -337,6 +358,27 @@ async function normalizeWorkBuddyError(response, trace) {
   } finally {
     void reader.cancel().catch(() => {});
   }
+}
+
+function systemOpeningDetail(body) {
+  const text = requestBodyText(body);
+  if (!text) return "";
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return ""; }
+  if (!Array.isArray(parsed?.messages)) return "";
+  const lines = [];
+  for (const message of parsed.messages) {
+    if (message?.role !== "system" && message?.role !== "developer") continue;
+    const content = typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content.map((part) => part?.text).filter((part) => typeof part === "string").join("\n")
+        : "";
+    const line = content.trim().split("\n", 1)[0].slice(0, 80);
+    if (line) lines.push(line);
+    if (lines.length >= 2) break;
+  }
+  return lines.length ? ` 发出的开头：${lines.join(" | ")}` : "";
 }
 
 function chatIdentityHeaders(trace, existing) {
@@ -396,7 +438,7 @@ function workBuddyRequestOptions(options) {
         const merged = codeBuddyHeaders(callerHeaders, identity, { identityHeaders });
         const response = await fetchImpl(input, { ...prepared, headers: merged });
         traceEvent(trace, "http.headers", { elapsedMs: Date.now() - started, status: response.status });
-        return await normalizeWorkBuddyError(response, trace);
+        return await normalizeWorkBuddyError(response, trace, systemOpeningDetail(prepared?.body));
       } catch (error) {
         traceEvent(trace, "http.error", { elapsedMs: Date.now() - started, ...errorFields(error) });
         throw error;

@@ -812,6 +812,7 @@ test("WorkBuddy 出站身份句只改写系统指令，保留用户、工具和�
   expected.messages[0].content = `Follow the instructions below.\n\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
   expected.messages[1].content[0].text = "Follow the instructions below.";
   expected.messages[1].content[1].text = "Follow the instructions below.\n\n保留工具说明。";
+  expected.messages[3].content = "You are an AI coding assistant.";
   assert.deepEqual(actual, expected);
   assert.equal(init.body, JSON.stringify(body));
   assert.equal(new Headers(sent.headers).get("authorization"), "Bearer test-key");
