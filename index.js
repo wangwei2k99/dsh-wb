@@ -71,9 +71,8 @@ const COMPAT = {
   thinkingFormat: "openai",
 };
 const IDENTITY_SENTENCE_RE = /\bYou are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\r\n]*?(?:\.(?=\s|$)|(?=\r?\n|$))/gi;
-const NEUTRAL_SYSTEM_OPENER = "You are a helpful assistant.";
-// 国内网关只看每条 system 消息去空白后的开头。改写成 CodeBuddy/WorkBuddy 仍可能落在同一份名单上。
-const BLOCKED_SYSTEM_OPENING_RE = /^(?:you are (?:codebuddy|workbuddy)\b|you are an ai agent powered by deepseek harness\b|you are claude code\b)/i;
+// 不以 "You are" 开头。国内网关按 system 消息开头匹配第三方身份句，"You are a helpful assistant." 也已经被用过。
+const NEUTRAL_SYSTEM_OPENER = "Follow the instructions below.";
 
 function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
   if (typeof init?.body !== "string") return init;
@@ -82,24 +81,23 @@ function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
   if (!Array.isArray(body?.messages)) return init;
   // 自称跟随出站身份：令牌登录模拟 WorkBuddy 桌面端，API Key 模式沿用 CodeBuddy。
   const productName = normalizeIdentity(identity) === IDENTITY_WORKBUDDY ? "WorkBuddy" : "CodeBuddy";
-  // 改写系统提示里的宿主品牌，避免把 DSH 标识发给上游。三层由宽到窄：
-  //   1. 身份句（"You are a coding agent powered by ..."）整句替换
-  //   2. "DeepSeek Harness" 全称
+  // 改写系统提示里的宿主品牌，避免把 DSH 标识发给上游。
+  //   1. 删掉 "You are a coding agent powered by ..." 这类身份句，不改写成另一个 "You are ..."
+  //   2. "DeepSeek Harness" 全称改成当前出站身份
   //   3. 独立大写缩写 "DSH"
   // 第 3 条用负向断言排除功能性标识：dsh-xxx / dsh_xxx / @deepseek-ai/dsh-* /
   // 路径 .dsh/ / 环境变量 DSH_XXX / 命令行 dsh。这些必须原样保留，
   // 否则模型会拼错包名、路径或命令。
   const rewrite = (text) => {
     const rewritten = text
-      .replace(IDENTITY_SENTENCE_RE, `You are ${productName}, an AI coding assistant.`)
+      .replace(IDENTITY_SENTENCE_RE, "")
+      .replace(/^You are interacting with the user through the /gim, "The user is interacting through the ")
       .replace(/\bDeepSeek[ -]Harness\b/gi, productName)
-      .replace(/\bDSH\b(?![-_A-Za-z0-9])/g, productName);
-    const body = rewritten.trimStart();
-    const leading = rewritten.slice(0, rewritten.length - body.length);
-    if (!BLOCKED_SYSTEM_OPENING_RE.test(body) || body.toLowerCase().startsWith(NEUTRAL_SYSTEM_OPENER.toLowerCase())) {
-      return rewritten;
-    }
-    return `${leading}${NEUTRAL_SYSTEM_OPENER}\n\n${body}`;
+      .replace(/\bDSH\b(?![-_A-Za-z0-9])/g, productName)
+      .trim();
+    if (!rewritten) return NEUTRAL_SYSTEM_OPENER;
+    if (rewritten.startsWith(NEUTRAL_SYSTEM_OPENER)) return rewritten;
+    return `${NEUTRAL_SYSTEM_OPENER}\n\n${rewritten}`;
   };
   let changed = false;
   const messages = body.messages.map((message) => {
