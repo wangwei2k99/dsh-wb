@@ -77,13 +77,13 @@ harness credential store 的 `llm-pi-ai/<provider id>` 记录，由宿主负责�
 在 **设置 → 插件 → 添加插件** 中安装：
 
 ```text
-github:wangwei2k99/dsh-workbuddy
+github:wangwei2k99/dsh-wb
 ```
 
 也可以在终端执行，更新时使用同一条命令：
 
 ```powershell
-dsh plugin --profile desktop add github:wangwei2k99/dsh-workbuddy
+dsh plugin --profile desktop add github:wangwei2k99/dsh-wb
 ```
 
 > **为什么不是 `@wangwei2k99/dsh-workbuddy@latest`**：这个包目前**没有发布到
@@ -106,7 +106,7 @@ node cli.js install
 仅安装 Web Profile：
 
 ```powershell
-dsh plugin --profile web add github:wangwei2k99/dsh-workbuddy
+dsh plugin --profile web add github:wangwei2k99/dsh-wb
 ```
 
 **安装或更新后，完整退出并重新启动 DSH。** 只刷新页面不会完成更新。
@@ -118,7 +118,7 @@ dsh plugin --profile web add github:wangwei2k99/dsh-workbuddy
 >
 > ```powershell
 > dsh plugin --profile desktop remove @axiaohungry/dsh-llm-workbuddy
-> dsh plugin --profile desktop add github:wangwei2k99/dsh-workbuddy
+> dsh plugin --profile desktop add github:wangwei2k99/dsh-wb
 > ```
 >
 > `node cli.js install` 会自动清理旧包名和旧行 id。

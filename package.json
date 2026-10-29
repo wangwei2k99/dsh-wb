@@ -24,11 +24,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wangwei2k99/dsh-workbuddy.git"
+    "url": "git+https://github.com/wangwei2k99/dsh-wb.git"
   },
-  "homepage": "https://github.com/wangwei2k99/dsh-workbuddy#readme",
+  "homepage": "https://github.com/wangwei2k99/dsh-wb#readme",
   "bugs": {
-    "url": "https://github.com/wangwei2k99/dsh-workbuddy/issues"
+    "url": "https://github.com/wangwei2k99/dsh-wb/issues"
   },
   "files": [
     "index.js",
