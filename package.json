@@ -1,6 +1,6 @@
 {
   "name": "@wangwei2k99/dsh-workbuddy",
-  "version": "0.2.1-rc.4",
+  "version": "0.2.1-rc.3",
   "packageManager": "pnpm@11.19.0",
   "description": "通过 WorkBuddy API Key 或 WorkBuddy 登录令牌为 DeepSeek Harness 接入 WorkBuddy 模型",
   "author": "WangWei2k99",
