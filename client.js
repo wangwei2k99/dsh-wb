@@ -86,7 +86,8 @@ window.__ModuleLoader__.load({
      * Kimi 网关输出天花板是 32K，所以后三档输出都取 32K，差别只在窗口。
      * Pro 与 Highspeed 用同一组窗口档位（200K / 400K / 1M）：两者是同一能力，
      * 只是 Highspeed 预填更快，档位没必要再分开，免得同名档位在两个模型上窗口不同。
-     * GLM-5.3 不能关思考，官方编码预算常用 64K 输出，长上下文评测停在 300K。
+     * GLM-5.3 不能关思考，官方编码预算常用 64K 输出；窗口档位与 Kimi 对齐为 200K / 400K / 1M，
+     * 输出预算保持 GLM 自己的 64K / 64K / 128K 不变。
      * 最高档不写死在表里：目录返回后直接用该模型的 maxInputTokens 和 maxOutputTokens。
      * 下面的 project 只在目录还没到时兜底。
      */
@@ -112,7 +113,7 @@ window.__ModuleLoader__.load({
       "glm-5.3": {
         chat: { contextWindow: 64000, maxTokens: 32000 },
         coding: { contextWindow: 200000, maxTokens: 64000 },
-        document: { contextWindow: 300000, maxTokens: 64000 },
+        document: { contextWindow: 400000, maxTokens: 64000 },
         project: { contextWindow: 1000000, maxTokens: 128000 },
       },
     };

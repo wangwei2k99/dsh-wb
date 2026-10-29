@@ -561,6 +561,17 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   }
   assert.ok(!kimiPro.includes("128000"), "Kimi 不应再有 128K 档");
   assert.ok(!kimiPro.includes("256000"), "Kimi 不应再有 256K 档");
+
+  /*
+   * GLM 窗口档位与 Kimi 对齐为 200K / 400K / 1M，但输出预算必须保持 GLM 自己的
+   * 64K / 64K / 128K —— 不能为了对齐窗口把 GLM 的输出也压成 32K。
+   */
+  const glm = client.match(/"glm-5\.3":\s*\{([\s\S]*?)\n      \}/)?.[1] ?? "";
+  assert.ok(glm.length > 0, "必须能取到 glm-5.3 的档位表");
+  assert.match(glm, /coding:\s*\{\s*contextWindow: 200000,\s*maxTokens: 64000\s*\}/, "GLM 日常编码应为 200K / 64K");
+  assert.match(glm, /document:\s*\{\s*contextWindow: 400000,\s*maxTokens: 64000\s*\}/, "GLM 超长文档应为 400K / 64K");
+  assert.match(glm, /project:\s*\{\s*contextWindow: 1000000,\s*maxTokens: 128000\s*\}/, "GLM 大型项目应为 1M / 128K");
+  assert.ok(!glm.includes("contextWindow: 300000"), "GLM 不应再有 300K 档");
   assert.doesNotMatch(client, /ceiling \/ 5/);
   assert.doesNotMatch(client, /ceiling \/ 4/);
   assert.match(web, /contextWindowMax: cap\?\.contextWindow/);
