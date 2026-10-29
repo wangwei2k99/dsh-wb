@@ -83,7 +83,9 @@ window.__ModuleLoader__.load({
 
     /**
      * 点名模型的前三档不走通用表。
-     * Kimi 网关输出天花板是 32K。Highspeed 前三档窗口更紧，避免预填延迟吃掉速度优势。
+     * Kimi 网关输出天花板是 32K，所以后三档输出都取 32K，差别只在窗口。
+     * Pro 与 Highspeed 用同一组窗口档位（200K / 400K / 1M）：两者是同一能力，
+     * 只是 Highspeed 预填更快，档位没必要再分开，免得同名档位在两个模型上窗口不同。
      * GLM-5.3 不能关思考，官方编码预算常用 64K 输出，长上下文评测停在 300K。
      * 最高档不写死在表里：目录返回后直接用该模型的 maxInputTokens 和 maxOutputTokens。
      * 下面的 project 只在目录还没到时兜底。
@@ -98,13 +100,13 @@ window.__ModuleLoader__.load({
       "kimi-k3.1-pro": {
         chat: { contextWindow: 32000, maxTokens: 16000 },
         coding: { contextWindow: 200000, maxTokens: 32000 },
-        document: { contextWindow: 300000, maxTokens: 32000 },
+        document: { contextWindow: 400000, maxTokens: 32000 },
         project: { contextWindow: 1000000, maxTokens: 32000 },
       },
       "kimi-k3.1-pro-highspeed": {
         chat: { contextWindow: 32000, maxTokens: 16000 },
-        coding: { contextWindow: 128000, maxTokens: 32000 },
-        document: { contextWindow: 256000, maxTokens: 32000 },
+        coding: { contextWindow: 200000, maxTokens: 32000 },
+        document: { contextWindow: 400000, maxTokens: 32000 },
         project: { contextWindow: 1000000, maxTokens: 32000 },
       },
       "glm-5.3": {

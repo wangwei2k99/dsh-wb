@@ -546,6 +546,21 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
   assert.match(client, /"kimi-k3\.1-pro"/);
   assert.match(client, /"kimi-k3\.1-pro-highspeed"/);
   assert.match(client, /"glm-5\.3"/);
+  /*
+   * Kimi 两个模型共用同一组窗口档位（200K / 400K / 1M）。
+   * 以前 Highspeed 用 128K / 256K，同一个「超长文档」在两个 Kimi 上给出的窗口不同，
+   * 用户切模型后会发现同样选档、预算却变了。这里锁死两者一致。
+   */
+  const kimiPro = client.match(/"kimi-k3\.1-pro":\s*\{([\s\S]*?)\n      \}/)?.[1] ?? "";
+  const kimiHigh = client.match(/"kimi-k3\.1-pro-highspeed":\s*\{([\s\S]*?)\n      \}/)?.[1] ?? "";
+  assert.ok(kimiPro.length > 0, "必须能取到 kimi-k3.1-pro 的档位表");
+  assert.ok(kimiHigh.length > 0, "必须能取到 kimi-k3.1-pro-highspeed 的档位表");
+  assert.equal(kimiHigh.trim(), kimiPro.trim(), "两个 Kimi 的窗口档位必须完全一致");
+  for (const window of ["200000", "400000", "1000000"]) {
+    assert.ok(kimiPro.includes(window), `Kimi 档位应包含 ${window}`);
+  }
+  assert.ok(!kimiPro.includes("128000"), "Kimi 不应再有 128K 档");
+  assert.ok(!kimiPro.includes("256000"), "Kimi 不应再有 256K 档");
   assert.doesNotMatch(client, /ceiling \/ 5/);
   assert.doesNotMatch(client, /ceiling \/ 4/);
   assert.match(web, /contextWindowMax: cap\?\.contextWindow/);
