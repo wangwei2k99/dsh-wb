@@ -331,6 +331,16 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
     const channelFailure = /conversation id missing|request illegal/.test(msgLower);
     const promptOpeningFailure = /unapproved channel|illegal api invocation/.test(msgLower);
     const bodyShapeFailure = /first message is not system prompt/.test(msgLower);
+    /*
+     * 11158 —— 该账号类型无权使用这个模型。上游原文形如
+     *   model [kimi-k3.1-pro-highspeed] is not allowed for user type [enterprise_user]
+     * 实测同账号下 kimi-k3.1-pro / deepseek-v4.1-flash 均可用，只有个别模型被挡，
+     * 所以这既不是凭据失效，也不是上下文超窗，换 Key 也没用——要换模型或找管理员开权限。
+     * 把模型名和账号类型摘出来，用户才知道该动哪里。
+     */
+    const modelForbidden = code === "11158";
+    const forbiddenModel = upstreamMsg.match(/model\s*\[([^\]]+)\]\s*is not allowed/i)?.[1];
+    const forbiddenUserType = upstreamMsg.match(/user type\s*\[([^\]]+)\]/i)?.[1];
 
     // 不同业务码的处置方式完全不同，混成一句"请求失败"会误导用户：
     //   11140 —— 账号级限制（"账号存在异常行为，已被限制使用"），
@@ -344,6 +354,12 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
       11101: "：请求形态不被接受（该接口要求流式请求）。",
     };
     let hint = hints[code] ?? "";
+    if (modelForbidden) {
+      const model = forbiddenModel ? `「${forbiddenModel}」` : "该模型";
+      const userType = forbiddenUserType ? `（账号类型 ${forbiddenUserType}）` : "";
+      hint = `：当前账号${userType}无权使用${model}。这不是凭据失效、也不是上下文超限，`
+        + "换 Key 同样无效——请改选其它模型，或联系管理员为这个账号开通该模型权限。";
+    }
     if (code === "11128" || code === "11-128") {
       hint = channelFailure
         ? "：渠道校验未通过（缺少会话标识头族）。请确认插件版本已包含 X-Conversation-* 三件套。"
@@ -356,6 +372,17 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
     // 其它业务码也可能是上下文超限（上游换措辞时不留死角），按 msg 兜底识别。
     if (!hint && /context[\s_-]*(?:length|window)|prompt\s+(?:is\s+)?too\s+(?:long|large)|maximum\s+context/i.test(upstreamMsg)) {
       hint = overflowHint;
+    }
+    /*
+     * 还没识别过的业务码：把上游原话带上。
+     *
+     * 只显示「业务码 11158」对排查毫无帮助——用户不知道该换模型还是换 Key。
+     * 上游的 msg 本身就写着原因（例如 "model [...] is not allowed for user type [...]"），
+     * 原样透出来比任何猜测都有用。过长的内容截断，避免把整段 HTML 塞进界面。
+     */
+    if (!hint && upstreamMsg) {
+      const quoted = upstreamMsg.length > 200 ? `${upstreamMsg.slice(0, 200)}…` : upstreamMsg;
+      hint = `：${quoted}`;
     }
     const headers = new Headers(response.headers);
     headers.delete("content-length");

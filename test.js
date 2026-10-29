@@ -937,6 +937,43 @@ test("WorkBuddy 上游业务码可见，错误正文不会泄露，成功响应�
     .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
   assert.match(shapeText, /首条消息必须是 system/);
 
+  /*
+   * 11158 —— 账号类型无权使用该模型。上游原文实测为
+   *   model [kimi-k3.1-pro-highspeed] is not allowed for user type [enterprise_user]
+   * 同账号下 kimi-k3.1-pro / deepseek-v4.1-flash 都可用，所以这不是凭据或上下文问题。
+   * 提示必须带出模型名与账号类型，否则用户只会看到一句「请求失败」而不知道该换模型。
+   */
+  const forbidden = Response.json({
+    code: 11158,
+    msg: "model [kimi-k3.1-pro-highspeed] is not allowed for user type [enterprise_user]",
+  }, { status: 400 });
+  const forbiddenText = await __testing.workBuddyRequestOptions({ fetch: async () => forbidden })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.match(forbiddenText, /11158/);
+  assert.match(forbiddenText, /kimi-k3\.1-pro-highspeed/, "必须带出被拒的模型名");
+  assert.match(forbiddenText, /enterprise_user/, "必须带出账号类型");
+  assert.match(forbiddenText, /无权使用/);
+  // 关键：不能误导成凭据失效或上下文超窗，否则用户会去换 Key、调窗口，白折腾。
+  assert.match(forbiddenText, /换 Key 同样无效/);
+  assert.doesNotMatch(forbiddenText, /context_length_exceeded/);
+  assert.doesNotMatch(forbiddenText, /重新登录/);
+
+  /*
+   * 没识别过的业务码：必须把上游原话透出来。
+   * 只显示「业务码 XXXXX」的话，用户无法判断该换模型、换 Key 还是改请求。
+   */
+  const unknown = Response.json({ code: 11999, msg: "rate limited by tenant policy" }, { status: 400 });
+  const unknownText = await __testing.workBuddyRequestOptions({ fetch: async () => unknown })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.match(unknownText, /11999/);
+  assert.match(unknownText, /rate limited by tenant policy/, "未知业务码也要带出上游原话");
+
+  // 超长 msg 截断，不把整段内容塞进界面。
+  const longMsg = Response.json({ code: 11998, msg: "x".repeat(500) }, { status: 400 });
+  const longText = await __testing.workBuddyRequestOptions({ fetch: async () => longMsg })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.ok(longText.length < 600, `超长 msg 必须截断，实际 ${longText.length}`);
+
   for (const body of ["not-json", JSON.stringify({ msg: "unknown" }), "x".repeat(32_768)]) {
     const error = new Response(body, { status: 400 });
     const result = await __testing.workBuddyRequestOptions({ fetch: async () => error }).fetch("https://copilot.tencent.com/v2/chat/completions", {});
