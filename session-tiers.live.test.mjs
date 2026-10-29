@@ -151,6 +151,38 @@ test("agent/request 拦截会把输出预算写进冻结配置", async () => {
   assert.equal(config.provider, "workbuddy-cn", "不得丢失 provider");
   assert.equal(config.model, "m", "不得丢失 model");
   assert.ok(config.maxTokens <= 32_000, `预算必须收敛到窗口内: ${config.maxTokens}`);
+  assert.equal(config.contextWindow, 32_000, "压缩阈值必须跟着本会话窗口，不能留在模型目录的高档");
+});
+
+test("prepareCall 按请求自己的 sessionId 取窗口，不跟焦点会话走", async () => {
+  const h = host();
+  const { api } = installSessionTiers(h.ctx, undefined);
+  api.write("sess-A", { contextWindow: 32_000, maxTokens: 16_000 });
+  api.write("sess-B", { contextWindow: 1_000_000, maxTokens: 128_000 });
+
+  const prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m", sessionId: "sess-B" });
+  assert.equal(prepared.context.contextWindow, 1_000_000);
+  assert.equal(prepared.model.contextWindow, 1_000_000);
+  assert.equal(api.read("sess-A").override.contextWindow, 32_000);
+});
+
+test("同一会话从高档切到低档后，下一次请求按低档窗口", async () => {
+  const h = host();
+  const { api } = installSessionTiers(h.ctx, undefined);
+  api.write("sess-A", { contextWindow: 1_000_000, maxTokens: 128_000 });
+  let prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
+  assert.equal(prepared.context.contextWindow, 1_000_000);
+
+  api.write("sess-A", { contextWindow: 32_000, maxTokens: 16_000 });
+  prepared = await h.ctx.llm.prepareCall({ provider: "workbuddy-cn", model: "m" });
+  assert.equal(prepared.context.contextWindow, 32_000);
+  assert.equal(prepared.model.contextWindow, 32_000);
+  const handler = h.handlers.get("agent/request");
+  const config = await handler(
+    { agent: { id: "sess-A" } },
+    () => Promise.resolve({ provider: "workbuddy-cn", model: "m", maxTokens: 128_000, contextWindow: 1_000_000 }),
+  );
+  assert.equal(config.contextWindow, 32_000);
 });
 
 test("没有会话身份时不干预请求", async () => {

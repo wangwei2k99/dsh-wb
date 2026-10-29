@@ -215,7 +215,7 @@ test("桌面端 prepared stream 能发送文本并收到首个模型输出", asy
     assert.equal(new Headers(options.headers).get("x-ide-name"), "CodeBuddy");
     const body = JSON.parse(options.body);
     if (expectedSystem) {
-      assert.ok(body.messages.some(message => message.role === "system" && message.content.startsWith("You are a helpful assistant.")));
+      assert.ok(body.messages.some(message => message.role === "system" && message.content.startsWith("You are CodeBuddy, Tencent's official CLI.")));
     }
     if (expectedTools) assert.equal(body.tools.length, expectedTools.length);
     for (const message of body.messages.filter((entry) => ["system", "developer"].includes(entry.role))) {
@@ -379,14 +379,13 @@ test("没有会话 id 时档位控件只读", () => {
   assert.match(client, /"aria-haspopup": readOnly \? undefined : "menu"/);
 });
 
-test("会话覆盖先读后写，且提供恢复默认", () => {
+test("会话覆盖先读后写，没有恢复默认入口", () => {
   const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
   // 初值优先用本会话覆盖，没有再回落到模型级默认值。
   assert.match(client, /tier\?\.override \?\? null/);
   assert.match(client, /override\?\.contextWindow/);
-  // 撤销入口只在存在覆盖时出现，并写 null 清除。
-  assert.match(client, /contextWindow: null \}\)/);
-  assert.match(client, /hasOverride && createElement/);
+  assert.doesNotMatch(client, /恢复默认/);
+  assert.doesNotMatch(client, /contextWindow: null/);
 });
 
 test("会话级档位只动内存，按 sessionId 隔离", () => {
@@ -417,12 +416,11 @@ test("会话窗口可以大于配置默认值，写入仍不超过上游上限",
   assert.equal(resolveSessionWindow(1_000_000, 2_000_000).effective, 1_000_000);
 });
 
-test("清除会话档位必须显式传 null，缺字段不能当清除", () => {
+test("会话档位接口只接受正整数窗口，不提供清除", () => {
   const web = readFileSync(new URL("./workbuddy-web.js", import.meta.url), "utf8");
-  // 漏传 contextWindow 若被当成清除，会静默抹掉用户的设置。
-  assert.match(web, /Object\.hasOwn\(body, "contextWindow"\) && body\.contextWindow === null/);
-  assert.match(web, /explicitClear/);
-  assert.match(web, /必须是正整数，或显式传 null 清除/);
+  assert.match(web, /contextWindow 必须是正整数/);
+  assert.doesNotMatch(web, /explicitClear/);
+  assert.doesNotMatch(web, /sessionTiers\.write\(sessionId, null\)/);
 });
 
 test("下拉菜单与官方原生菜单同档表面色", () => {
@@ -540,7 +538,8 @@ test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", ()
     "添加模型时应落到日常编码档",
   );
   assert.match(client, /label: "简短问答"/);
-  assert.match(client, /label: "日常编码"/);
+  assert.match(client, /label: "日常编码（默认）"/);
+  assert.doesNotMatch(client, /恢复默认/);
   assert.match(client, /label: "超长文档"/);
   assert.match(client, /label: "大型项目"/);
   assert.match(client, /"deepseek-v4\.1-flash"/);
@@ -760,6 +759,9 @@ test("CodeBuddy identity wins at the final HTTP boundary without changing creden
     assert.equal(headers.get("x-ide-type"), "CLI");
     assert.equal(headers.get("x-ide-name"), "CodeBuddy");
     assert.equal(headers.get("x-ide-version"), "2.171.0");
+    assert.equal(headers.get("x-requested-with"), "XMLHttpRequest");
+    assert.equal(headers.get("x-codebuddy-request"), "1");
+    assert.equal(headers.get("x-private-data"), "true");
     assert.equal(headers.get("authorization"), "Bearer private");
     assert.equal(headers.get("x-api-key"), null);
     assert.equal(headers.get("existing"), "value");
@@ -809,10 +811,11 @@ test("WorkBuddy 出站身份句只改写系统指令，保留用户、工具和�
   assert.strictEqual(await options.fetch("https://copilot.tencent.com/v2/chat/completions", init), response);
   const actual = JSON.parse(sent.body);
   const expected = structuredClone(body);
-  expected.messages[0].content = `You are a helpful assistant.\n\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
-  expected.messages[1].content[0].text = "You are a helpful assistant.";
-  expected.messages[1].content[1].text = "You are a helpful assistant.\n\n保留工具说明。";
-  expected.messages[3].content = "You are an AI coding assistant.";
+  expected.messages[0].content = `You are CodeBuddy, Tencent's official CLI.\n保留开发约束。 ${plain.replaceAll("DeepSeek Harness", "CodeBuddy")}`;
+  expected.messages[1].role = "system";
+  expected.messages[1].content[0].text = "You are CodeBuddy, Tencent's official CLI.";
+  expected.messages[1].content[1].text = "You are CodeBuddy, Tencent's official CLI.\n保留工具说明。";
+  expected.messages[3].content = "You are CodeBuddy, Tencent's official CLI.";
   assert.deepEqual(actual, expected);
   assert.equal(init.body, JSON.stringify(body));
   assert.equal(new Headers(sent.headers).get("authorization"), "Bearer test-key");
@@ -841,10 +844,11 @@ test("WorkBuddy uses CodeBuddy runtime branding only in instruction roles", asyn
   } });
   await options.fetch("https://copilot.tencent.com/v2/chat/completions", { body: original });
   const expected = structuredClone(body);
-  const surfaced = `You are a helpful assistant.\n\nThe user is interacting through the ${branded.replaceAll("DeepSeek Harness", "CodeBuddy").replace(/^You are interacting with the user through the /, "")}`;
+  const surfaced = `The user is interacting through the ${branded.replaceAll("DeepSeek Harness", "CodeBuddy").replace(/^You are interacting with the user through the /, "")}`;
   expected.messages[0].content = surfaced;
+  expected.messages[1].role = "system";
   expected.messages[1].content[0].text = surfaced;
-  expected.messages[1].content[1].text = "You are a helpful assistant.\n\n保留权限、工作目录和工具规则。";
+  expected.messages[1].content[1].text = "保留权限、工作目录和工具规则。";
   assert.deepEqual(JSON.parse(sent.body), expected);
   assert.equal(JSON.stringify(body), original);
   assert.equal(blocks[0].text, branded);
@@ -885,6 +889,24 @@ test("DSH 缩写替换为产品名，功能性标识（包名/路径/命令/环�
   assert.match(actual, /\/home\/user\/\.dsh\/profiles\/web/);
   assert.match(actual, /DSH_DEBUG=1/);
 });
+test("DSH 的 @ 路径说明整句改写，避免渠道名单命中", async () => {
+  const sentence = "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths stay.";
+  let sent;
+  const options = __testing.workBuddyRequestOptions({ fetch: async (_url, init) => {
+    sent = init;
+    return new Response("ok");
+  } });
+  await options.fetch("https://copilot.tencent.com/v2/chat/completions", {
+    body: JSON.stringify({ messages: [{ role: "system", content: sentence }] }),
+  });
+  const actual = JSON.parse(sent.body).messages[0].content;
+  assert.equal(actual, "An @ prefix marks paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths stay.");
+
+  await options.fetch("https://copilot.tencent.com/v2/chat/completions", {
+    body: JSON.stringify({ messages: [{ role: "assistant", content: sentence }] }),
+  });
+  assert.equal(JSON.parse(sent.body).messages[0].content, "An @ prefix marks paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths stay.");
+});
 test("WorkBuddy 上游业务码可见，错误正文不会泄露，成功响应保持流式", async () => {
   const original = Response.json({ code: 11128, msg: "secret-value", displayTips: { zh: "private" } }, { status: 400 });
   const options = __testing.workBuddyRequestOptions({ fetch: async () => original });
@@ -906,7 +928,8 @@ test("WorkBuddy 上游业务码可见，错误正文不会泄露，成功响应�
   const opening = Response.json({ code: 11128, msg: "Illegal API invocation from an unapproved channel" }, { status: 400 });
   const openingText = await __testing.workBuddyRequestOptions({ fetch: async () => opening })
     .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
-  assert.match(openingText, /系统提示开头/);
+  assert.match(openingText, /提示词命中上游渠道名单/);
+  assert.match(openingText, /不一定在第一行/);
   assert.doesNotMatch(openingText, /缺少会话标识头族/);
 
   const shape = Response.json({ code: 11128, msg: "first message is not system prompt" }, { status: 400 });
@@ -964,6 +987,29 @@ test("上下文超窗时按剩余空间收敛 maxTokens，塞满窗口则抛出�
   assert.ok(clamped.maxTokens > 0 && clamped.maxTokens < 128_000, String(clamped.maxTokens));
   // 模型没配窗口时行为不变。
   assert.strictEqual(__testing.boundContextBudget({ maxTokens: 1000 }, over, compaction), compaction);
+});
+
+test("同一会话从高档切到低档时，超出新窗口会触发可压缩的溢出", () => {
+  const catalog = { contextWindow: 1_000_000, maxTokens: 128_000 };
+  const history = { messages: [{ role: "assistant", content: [{ type: "text", text: "字".repeat(80_000) }] }] };
+  const options = { maxTokens: 32_000, sessionId: "sess-low" };
+  __testing.setSessionTierWindow((sessionId) => sessionId === "sess-low" ? 32_000 : sessionId === "sess-high" ? 1_000_000 : undefined);
+  try {
+    const lowWindow = __testing.sessionContextWindow(catalog, "sess-low");
+    assert.equal(lowWindow, 32_000);
+    assert.throws(() => __testing.boundContextBudget({ ...catalog, contextWindow: lowWindow }, history, options), (error) => {
+      assert.equal(error.code, "CONTEXT_WINDOW_EXCEEDED");
+      assert.match(error.message, /context_length_exceeded/);
+      return true;
+    });
+    const highWindow = __testing.sessionContextWindow(catalog, "sess-high");
+    assert.equal(highWindow, 1_000_000);
+    assert.doesNotThrow(() => __testing.boundContextBudget({ ...catalog, contextWindow: highWindow }, history, options));
+    assert.equal(__testing.sessionContextWindow(catalog, "sess-other"), 1_000_000);
+    assert.strictEqual(__testing.boundContextBudget({ ...catalog, contextWindow: lowWindow }, history, { ...options, purpose: "compaction" }).purpose, "compaction");
+  } finally {
+    __testing.setSessionTierWindow(undefined);
+  }
 });
 
 test("上游只回 1 个 token 的 length 判定为上下文溢出，11115 错误带机器可读标记", async () => {

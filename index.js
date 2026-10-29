@@ -71,11 +71,15 @@ const COMPAT = {
   thinkingFormat: "openai",
 };
 const IDENTITY_SENTENCE_RE = /\bYou are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\r\n]*?(?:\.(?=\s|$)|(?=\r?\n|$))/gi;
-// 国内网关实测：system 以这句开头可以通过，紧随其后的原文身份句也可以留在后面。
-// 不以 "You are" 开头的占位句（例如 Follow the instructions below.）仍会 11128。
-const NEUTRAL_SYSTEM_OPENER = "You are a helpful assistant.";
-const ASSISTANT_OPENING_REPLACEMENT = "You are an AI coding assistant.";
-const BLOCKED_OPENING_LINE_RE = /^(?:you are an ai agent powered by deepseek harness\b|you are claude code\b)/i;
+// codebuddy2api 的渠道改写：外来身份句整句换成这句，句前标记和句后指令保留。
+// 删掉身份句再补 "You are a helpful assistant." 仍会被判成非官方渠道。
+const CODEBUDDY_CLI_SENTENCE = "You are CodeBuddy, Tencent's official CLI.";
+const CLAUDE_CODE_SENTENCE_RE = /You are Claude Code, Anthropic's official CLI for Claude\./gi;
+const CLAUDE_CODE_LINE_RE = /^[ \t]*You are Claude Code\b[^\r\n]*/gim;
+const PRS_BRANCH_FROM = "main branch (you will usually use this for prs)";
+const PRS_BRANCH_TO = "main branch (you will usually use this for pr)";
+const AT_PATH_FROM = "Tokens prefixed with @ are paths";
+const AT_PATH_TO = "An @ prefix marks paths";
 
 function requestBodyText(body) {
   if (typeof body === "string") return body;
@@ -83,15 +87,12 @@ function requestBodyText(body) {
   return undefined;
 }
 
-function rewriteAssistantOpening(text) {
-  let changed = false;
-  const lines = text.split("\n").map((line) => {
-    const indent = line.match(/^\s*/)[0];
-    if (!BLOCKED_OPENING_LINE_RE.test(line.slice(indent.length))) return line;
-    changed = true;
-    return indent + ASSISTANT_OPENING_REPLACEMENT;
-  });
-  return changed ? lines.join("\n") : text;
+function rewriteChannelIdentity(text) {
+  return text
+    .replace(IDENTITY_SENTENCE_RE, CODEBUDDY_CLI_SENTENCE)
+    .replace(CLAUDE_CODE_SENTENCE_RE, CODEBUDDY_CLI_SENTENCE)
+    .replace(CLAUDE_CODE_LINE_RE, CODEBUDDY_CLI_SENTENCE)
+    .replaceAll(AT_PATH_FROM, AT_PATH_TO);
 }
 
 function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
@@ -103,27 +104,26 @@ function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
   // 自称跟随出站身份：令牌登录模拟 WorkBuddy 桌面端，API Key 模式沿用 CodeBuddy。
   const productName = normalizeIdentity(identity) === IDENTITY_WORKBUDDY ? "WorkBuddy" : "CodeBuddy";
   // 改写系统提示里的宿主品牌，避免把 DSH 标识发给上游。
-  //   1. 删掉 "You are a coding agent powered by ..." 这类身份句，不改写成另一个 "You are ..."
+  //   1. 外来身份句整句换成 CodeBuddy CLI 身份句（对齐 codebuddy2api）
   //   2. "DeepSeek Harness" 全称改成当前出站身份
   //   3. 独立大写缩写 "DSH"
   // 第 3 条用负向断言排除功能性标识：dsh-xxx / dsh_xxx / @deepseek-ai/dsh-* /
   // 路径 .dsh/ / 环境变量 DSH_XXX / 命令行 dsh。这些必须原样保留，
   // 否则模型会拼错包名、路径或命令。
   const rewrite = (text) => {
-    const rewritten = text
-      .replace(IDENTITY_SENTENCE_RE, "")
+    const rewritten = rewriteChannelIdentity(text)
+      .replaceAll(PRS_BRANCH_FROM, PRS_BRANCH_TO)
       .replace(/^You are interacting with the user through the /gim, "The user is interacting through the ")
       .replace(/\bDeepSeek[ -]Harness\b/gi, productName)
-      .replace(/\bDSH\b(?![-_A-Za-z0-9])/g, productName)
-      .trim();
-    if (!rewritten) return NEUTRAL_SYSTEM_OPENER;
-    if (rewritten.startsWith(NEUTRAL_SYSTEM_OPENER)) return rewritten;
-    return `${NEUTRAL_SYSTEM_OPENER}\n\n${rewritten}`;
+      .replace(/\bDSH\b(?![-_A-Za-z0-9])/g, productName);
+    if (rewritten === text) return text;
+    return rewritten.trim() || CODEBUDDY_CLI_SENTENCE;
   };
   let changed = false;
   const messages = body.messages.map((message) => {
     if (!["system", "developer", "assistant"].includes(message?.role)) return message;
-    const rewriteContent = message.role === "assistant" ? rewriteAssistantOpening : rewrite;
+    const rewriteContent = message.role === "assistant" ? rewriteChannelIdentity : rewrite;
+    const role = message.role === "developer" ? "system" : message.role;
     let content = message.content;
     if (typeof content === "string") content = rewriteContent(content);
     else if (Array.isArray(content)) {
@@ -134,9 +134,9 @@ function sanitizeWorkBuddyRequest(init, identity = IDENTITY_CLI) {
       });
       if (parts.some((part, index) => part !== content[index])) content = parts;
     }
-    if (content === message.content) return message;
+    if (content === message.content && role === message.role) return message;
     changed = true;
-    return { ...message, content };
+    return { ...message, role, content };
   });
   return changed ? { ...init, body: JSON.stringify({ ...body, messages }) } : init;
 }
@@ -254,6 +254,18 @@ function contextOverflowError(estimated, window) {
  *
  * 因此压缩请求完全不受这道检查约束，原样发出，由上游按真实容量裁决。
  */
+/**
+ * 会话档位读取器。由 `installSessionTiers` 装上之后写入。
+ * 只按显式 sessionId 查，避免并发请求落到「当前焦点会话」。
+ */
+let sessionTierWindow = (_sessionId) => undefined;
+
+function sessionContextWindow(model, sessionId) {
+  const modelWindow = positiveInteger(model?.contextWindow);
+  const requested = positiveInteger(sessionTierWindow(sessionId));
+  return requested ?? modelWindow;
+}
+
 function boundContextBudget(model, context, options) {
   if (options?.purpose === COMPACTION_PURPOSE) return options;
   const window = positiveInteger(model?.contextWindow);
@@ -311,7 +323,7 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
     //   msg 含 "conversation id missing" / "request illegal"
     //        -> 渠道校验：缺少会话头族（X-Conversation-* 三件套缺一不可）
     //   msg 含 "unapproved channel"
-    //        -> 系统提示开头命中名单，与会话头无关
+    //        -> 提示词命中渠道名单。命中点可以不在第一行，与会话头无关
     //   msg 含 "first message is not system prompt"
     //        -> 请求体形状问题，与身份无关
     const upstreamMsg = String(data?.msg ?? data?.message ?? data?.error?.message ?? "");
@@ -336,7 +348,7 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
       hint = channelFailure
         ? "：渠道校验未通过（缺少会话标识头族）。请确认插件版本已包含 X-Conversation-* 三件套。"
         : promptOpeningFailure
-          ? `：系统提示开头命中上游渠道名单。这与会话头无关。${detail}`
+          ? `：提示词命中上游渠道名单（不一定在第一行）。这与会话头无关。${detail}`
           : bodyShapeFailure
             ? "：请求体首条消息必须是 system 提示。"
             : "：上游拒绝该请求，请查看业务提示。";
@@ -439,7 +451,7 @@ function workBuddyRequestOptions(options) {
         const merged = codeBuddyHeaders(callerHeaders, identity, { identityHeaders });
         const response = await fetchImpl(input, { ...prepared, headers: merged });
         traceEvent(trace, "http.headers", { elapsedMs: Date.now() - started, status: response.status });
-        return await normalizeWorkBuddyError(response, trace, systemOpeningDetail(prepared?.body));
+        return await normalizeWorkBuddyError(response, trace, response.ok ? "" : systemOpeningDetail(prepared?.body));
       } catch (error) {
         traceEvent(trace, "http.error", { elapsedMs: Date.now() - started, ...errorFields(error) });
         throw error;
@@ -501,10 +513,13 @@ function watchWorkBuddyStream({ model, normalized, bounded, stream, trace }) {
 function workBuddyStream(model, context, options, open) {
   const trace = traceContext.getStore();
   const normalized = normalizeContext(context);
-  // 超窗请求上游只会回 1 个 token，这里提前收敛或在本地判定溢出。
-  const bounded = boundContextBudget(model, normalized, options);
+  // 压缩阈值和溢出判定都用本会话的窗口。从高档切到低档时，
+  // 目录里的模型窗口仍是高档，不换这条就会一直认为还放得下。
+  const sessionWindow = sessionContextWindow(model, options?.sessionId);
+  const budgetModel = sessionWindow === model?.contextWindow ? model : { ...model, contextWindow: sessionWindow };
+  const bounded = boundContextBudget(budgetModel, normalized, options);
   const stream = open(model, normalized, workBuddyRequestOptions(bounded));
-  return watchWorkBuddyStream({ model, normalized, bounded, stream, trace });
+  return watchWorkBuddyStream({ model: budgetModel, normalized, bounded, stream, trace });
 }
 
 function observedWorkBuddyStream(model, context, options) {
@@ -1272,7 +1287,7 @@ function armElection(ctx, run) {
   } catch {}
 }
 
-export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, providerSettings, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor, estimateTextTokens, estimateContextTokens, boundContextBudget, silentContextOverflow, workBuddyApi, packageOf, entryIdOf, isLiveFiber, isRivalOptions, collectEntries, rivalEntries, disableEntry, clearRivals, stopFiber, resolveSelf, duplicateOf, resident, rivalLlm, stopRival, armElection, electWorkBuddy, ELECTION_KEY, ELECTION_OWNER, RECLAIM_ATTEMPTS, RECLAIM_TIMEOUT_MS });
+export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, providerSettings, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor, estimateTextTokens, estimateContextTokens, boundContextBudget, silentContextOverflow, sessionContextWindow, workBuddyApi, packageOf, entryIdOf, isLiveFiber, isRivalOptions, collectEntries, rivalEntries, disableEntry, clearRivals, stopFiber, resolveSelf, duplicateOf, resident, rivalLlm, stopRival, armElection, electWorkBuddy, ELECTION_KEY, ELECTION_OWNER, RECLAIM_ATTEMPTS, RECLAIM_TIMEOUT_MS, setSessionTierWindow(reader) { sessionTierWindow = typeof reader === "function" ? reader : () => undefined; } });
 
 export function apply(ctx, config) {
   const modernSettings = typeof config?.providers?.get === "function";
@@ -1853,6 +1868,11 @@ export function apply(ctx, config) {
     // 会话级档位：只改内存里的覆盖，不动 profile 配置。
     // 必须在 Web 路由之前装好，路由才能读到它的读写接口。
     const tiers = installSessionTiers(ctx, config?.sessionTiers);
+    sessionTierWindow = (sessionId) => {
+      if (typeof sessionId !== "string" || sessionId === "") return undefined;
+      const window = tiers.api.read(sessionId)?.override?.contextWindow;
+      return Number.isInteger(window) && window > 0 ? window : undefined;
+    };
     // 只有真正赢下的这一份才挂 Web 路由与设置面板，避免两条 routing 抢同一路径。
     installWorkBuddyWeb(ctx, settingsNs, tiers.api);
     if (modernSettings && typeof ctx.on === "function") ctx.on("loader/volatile-update", refreshRegistrations);

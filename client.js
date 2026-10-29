@@ -65,7 +65,7 @@ window.__ModuleLoader__.load({
      */
     const TASK_PRESETS = [
       { id: "chat", label: "简短问答", hint: "几轮对话。窗口留得短，输出只够一段回答加少量思考" },
-      { id: "coding", label: "日常编码", hint: "日常改代码。窗口停在召回还稳的区间，输出留给思考和单文件" },
+      { id: "coding", label: "日常编码（默认）", hint: "日常改代码。窗口停在召回还稳的区间，输出留给思考和单文件" },
       { id: "document", label: "超长文档", hint: "整篇长文放进窗口。输出仍按摘要，不按整篇重写" },
       { id: "project", label: "大型项目", hint: "顶满该模型的上游窗口和输出上限" },
     ];
@@ -2286,8 +2286,6 @@ window.__ModuleLoader__.load({
       const [outputCeiling, setOutputCeiling] = useState(null);
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState(null);
-      // 本会话是否已偏离 profile 默认值。菜单里据此显示「恢复默认」。
-      const [hasOverride, setHasOverride] = useState(false);
       // 菜单开合状态必须与上面几个 hook 一起声明在 early return 之前：
       // React 要求每次渲染的 hook 调用顺序一致，放到 return null 之后会在
       // 缺少会话/模型时直接崩掉整个组件（表现为控件消失）。
@@ -2312,7 +2310,6 @@ window.__ModuleLoader__.load({
         ]).then(([result, tier]) => {
             if (disposed) return;
             const override = tier?.override ?? null;
-            setHasOverride(override !== null);
             setValue(
               typeof override?.contextWindow === "number"
                 ? override.contextWindow
@@ -2386,7 +2383,6 @@ window.__ModuleLoader__.load({
             setError(`该模型上下文上限为 ${formatTokenTier(result.contextWindowMax ?? appliedWindow)}，已按上限设置`);
           }
           if (typeof window !== "undefined") window.dispatchEvent(new Event(AUTH_STATE_EVENT));
-          setHasOverride(true);
         } catch (cause) {
           setValue(previous.contextWindow);
           setTokens(previous.maxTokens);
@@ -2408,28 +2404,6 @@ window.__ModuleLoader__.load({
         }]
         : presets;
       const current = options.find((option) => option.id === matched) ?? options[0];
-
-      /**
-       * 清除本会话覆盖，回到 profile 默认值。
-       * 仅在有覆盖时才有意义，所以只在覆盖存在时渲染这一项。
-       */
-      const clearOverride = async () => {
-        if (readOnly || busy || !hasOverride) return;
-        setOpen(false);
-        setBusy(true);
-        setError(null);
-        try {
-          await authRequest("session-tier", { sessionId: sessionKey, contextWindow: null });
-          const baseline = await authRequest("context-window", undefined, undefined, { model: modelId });
-          setValue(typeof baseline?.contextWindow === "number" ? baseline.contextWindow : DEFAULT_CONTEXT_WINDOW);
-          setTokens(typeof baseline?.maxTokens === "number" ? baseline.maxTokens : DEFAULT_MAX_TOKENS);
-          setHasOverride(false);
-        } catch (cause) {
-          setError(cause instanceof Error ? cause.message : "恢复默认失败");
-        } finally {
-          setBusy(false);
-        }
-      };
 
       // 结构照抄 DSH 官方 PermissionSelect：trigger 按钮 + 向上弹出的 Menu。
       // 官方用 ui-primitives 的 Menu 组件，但那是 shell 内部模块、插件无法 require，
@@ -2522,16 +2496,6 @@ window.__ModuleLoader__.load({
             strokeLinejoin: "round",
           }))),
           ])),
-          hasOverride && createElement("button", {
-            key: "reset",
-            type: "button",
-            role: "menuitem",
-            className: "wb-cw-option",
-            title: "只影响当前会话。恢复后本会话回到部署默认的窗口与输出",
-            onClick: () => { void clearOverride(); },
-          }, [
-            createElement("span", { key: "text", className: "wb-cw-option-text" }, "恢复默认"),
-          ]),
         ]),
       ]);
     }

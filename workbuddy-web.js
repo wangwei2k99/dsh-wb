@@ -866,18 +866,14 @@ export function installWorkBuddyWeb(ctx, settingsNs = "llm-pi-ai", sessionTiers)
         const body = await requestBody(req);
         const sessionId = sessionIdOf(body.sessionId);
         if (sessionId === undefined) return json(res, 400, { ok: false, message: "缺少会话 ID" });
-        // 只有显式 `contextWindow: null` 才算清除。字段直接缺失是客户端 bug，
-        // 不能当成清除 —— 否则漏传一个字段就会静默抹掉用户的设置。
-        const explicitClear = Object.hasOwn(body, "contextWindow") && body.contextWindow === null;
-        if (!explicitClear && !Number.isSafeInteger(Number(body.contextWindow))) {
-          return json(res, 400, { ok: false, message: "contextWindow 必须是正整数，或显式传 null 清除" });
+        const contextWindow = Number(body.contextWindow);
+        if (!Number.isSafeInteger(contextWindow) || contextWindow <= 0) {
+          return json(res, 400, { ok: false, message: "contextWindow 必须是正整数" });
         }
-        const result = explicitClear
-          ? sessionTiers.write(sessionId, null)
-          : sessionTiers.write(sessionId, {
-            contextWindow: Number(body.contextWindow),
-            ...(Number.isSafeInteger(body.maxTokens) ? { maxTokens: Number(body.maxTokens) } : {}),
-          });
+        const result = sessionTiers.write(sessionId, {
+          contextWindow,
+          ...(Number.isSafeInteger(body.maxTokens) ? { maxTokens: Number(body.maxTokens) } : {}),
+        });
         if (result.ok !== true) {
           // 「超过模型基准窗口」由调度层再校验，这里只挡明显非法的输入。
           return json(res, 400, { ok: false, message: result.error ?? "设置会话档位失败" });

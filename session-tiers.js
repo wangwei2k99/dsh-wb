@@ -280,8 +280,10 @@ export function installSessionTiers(ctx, config) {
         const maxTokens = clampCompletion(active.requested.maxTokens ?? config.maxTokens, window, settings);
         hits.applied += 1;
         remember(active.sessionId, { contextWindow: window, maxTokens });
-        if (config.maxTokens === maxTokens) return config;
-        return { ...config, maxTokens };
+        // 压缩策略读的是这次请求的窗口，不是模型目录里的高档。
+        // 只改 maxTokens 会让阈值停留在高档，从高档切到低档时不会压缩。
+        if (config.maxTokens === maxTokens && config.contextWindow === window) return config;
+        return { ...config, maxTokens, contextWindow: window };
       } catch {
         // 出任何问题都退回宿主原本的配置。
         return config;
@@ -304,7 +306,9 @@ export function installSessionTiers(ctx, config) {
        */
       const patched = function prepareCallWithSessionTier(callConfig, signal, configure) {
         try {
-          const active = activeOverride();
+          const active = overrideFor(callConfig?.agent)
+            ?? overrideOf(typeof callConfig?.sessionId === "string" ? callConfig.sessionId : undefined)
+            ?? activeOverride();
           if (active === undefined) return originalPrepareCall.call(this, callConfig, signal, configure);
           hits.prepareCall += 1;
           let resolution;

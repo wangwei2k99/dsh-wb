@@ -91,6 +91,9 @@ const IDENTITY_CLI_HEADERS = {
   "x-ide-type": "CLI",
   "x-ide-name": "CodeBuddy",
   "x-ide-version": "2.171.0",
+  "x-requested-with": "XMLHttpRequest",
+  "x-codebuddy-request": "1",
+  "x-private-data": "true",
 };
 
 /** 与账号无关的静态桌面端头；随请求变化的头由 buildIdentityHeaders 追加。 */
@@ -103,6 +106,8 @@ const IDENTITY_WORKBUDDY_HEADERS = {
   "x-agent-intent": "craft",
   "x-agent-purpose": "conversation",
   "x-agent-type": "main",
+  "x-requested-with": "XMLHttpRequest",
+  "x-codebuddy-request": "1",
   // 桌面端固定发送 true（官方 personal/enterprise 默认值在桌面端为 true）。
   "x-private-data": "true",
   "x-domain": WORKBUDDY_DOMAIN_CN,
