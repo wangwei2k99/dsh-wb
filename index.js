@@ -318,7 +318,13 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
     }
     const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const code = String(data?.code ?? data?.error?.code ?? "");
-    if (!/^\d{1,9}(?:-\d{1,9})?$/.test(code)) return response;
+    /*
+     * 业务码缺失时不能一概放弃：HTTP 429 本身已经足够说明是限流，
+     * 上游偶尔只回 {message:"rate limited"} 而不带数字码。这种也要给出可读提示，
+     * 否则界面只剩一句英文原话，看不出该等多久、是不是自己的配置问题。
+     */
+    const codeLooksValid = /^\d{1,9}(?:-\d{1,9})?$/.test(code);
+    if (!codeLooksValid && response.status !== 429) return response;
     // `11128` 是重载错误码，必须按 message 分支，否则会误诊：
     //   msg 含 "conversation id missing" / "request illegal"
     //        -> 渠道校验：缺少会话头族（X-Conversation-* 三件套缺一不可）
@@ -342,6 +348,21 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
     const forbiddenModel = upstreamMsg.match(/model\s*\[([^\]]+)\]\s*is not allowed/i)?.[1];
     const forbiddenUserType = upstreamMsg.match(/user type\s*\[([^\]]+)\]/i)?.[1];
 
+    /*
+     * 14003 —— 上游限流（HTTP 429，msg 为 "too many requests"）。
+     *
+     * 实测是账号级并发/频率限制：同账号下两个会话在同一分钟内请求会一起被打回，
+     * 单个会话连发也会连续命中。DSH 已经把 429 归类为 RATE_LIMIT 并按 5 次指数退避
+     * 重试（500ms 起、上限 10s），所以这里不需要再加一层重试，只需把话说清楚：
+     * 不是 Key 失效、不是模型没权限、也不是上下文超窗，等一会儿就好。
+     * 上游给 Retry-After 时按它的秒数算等待时间，比笼统说「稍后重试」有用。
+     */
+    const rateLimited = code === "14003" || response.status === 429;
+    const retryAfterRaw = response.headers.get("retry-after");
+    const retryAfterSeconds = retryAfterRaw !== null && /^\d+(?:\.\d+)?$/.test(retryAfterRaw.trim())
+      ? Math.ceil(Number(retryAfterRaw.trim()))
+      : undefined;
+
     // 不同业务码的处置方式完全不同，混成一句"请求失败"会误导用户：
     //   11140 —— 账号级限制（"账号存在异常行为，已被限制使用"），
     //            重新登录或换 Key 都无效，只能等上游解除
@@ -354,6 +375,14 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
       11101: "：请求形态不被接受（该接口要求流式请求）。",
     };
     let hint = hints[code] ?? "";
+    if (rateLimited) {
+      const wait = retryAfterSeconds === undefined
+        ? "请等几十秒后再试。"
+        : `请等约 ${retryAfterSeconds} 秒后再试。`;
+      hint = "：请求过于频繁，被上游限流。这是账号级的频率/并发限制，不是 Key 失效、也不是模型权限或上下文超窗；"
+        + `DSH 已按 429 自动重试，全部失败说明限流窗口还没过去。${wait}`
+        + "同时开多个会话、或单轮里连续调用模型时更容易触发，可以错开重试或减少并发。";
+    }
     if (modelForbidden) {
       const model = forbiddenModel ? `「${forbiddenModel}」` : "该模型";
       const userType = forbiddenUserType ? `（账号类型 ${forbiddenUserType}）` : "";
@@ -390,7 +419,9 @@ async function normalizeWorkBuddyError(response, trace, detail = "") {
     headers.set("content-type", "application/json");
     traceEvent(trace, "http.error-code", { status: response.status, upstreamCode: code });
     // The SDK expects error.message; WorkBuddy's top-level code/msg otherwise becomes "no body".
-    return new Response(JSON.stringify({ error: { code, message: `WorkBuddy 请求失败（HTTP ${response.status}，业务码 ${code}）${hint}` } }), {
+    // 没有业务码时不写空的「业务码 」，只留 HTTP 状态，避免出现「业务码 ）」这种残句。
+    const codeLabel = codeLooksValid ? `，业务码 ${code}` : "";
+    return new Response(JSON.stringify({ error: { code: codeLooksValid ? code : String(response.status), message: `WorkBuddy 请求失败（HTTP ${response.status}${codeLabel}）${hint}` } }), {
       status: response.status, statusText: response.statusText, headers,
     });
   } catch {

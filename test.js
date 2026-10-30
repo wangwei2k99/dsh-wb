@@ -964,6 +964,38 @@ test("WorkBuddy 上游业务码可见，错误正文不会泄露，成功响应�
   assert.match(shapeText, /首条消息必须是 system/);
 
   /*
+   * 14003 / HTTP 429 —— 上游限流。实测同一分钟内两个会话一起请求会双双被打回，
+   * 单会话连发也会连续命中。提示要说明这是账号级限流、不是 Key 或模型权限问题，
+   * 并且带上 Retry-After 的实际秒数（上游给了才有）。
+   */
+  const limited = Response.json({ code: 14003, msg: "too many requests" }, {
+    status: 429,
+    headers: { "retry-after": "30" },
+  });
+  const limitedText = await __testing.workBuddyRequestOptions({ fetch: async () => limited })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.match(limitedText, /14003/);
+  assert.match(limitedText, /请求过于频繁/);
+  assert.match(limitedText, /约 30 秒/, "必须用上 Retry-After 的秒数");
+  // 关键：不能误导成凭据失效、模型无权限或上下文超窗，否则用户会去换 Key、改窗口。
+  assert.match(limitedText, /不是 Key 失效/);
+  assert.doesNotMatch(limitedText, /context_length_exceeded/);
+  assert.doesNotMatch(limitedText, /重新登录/);
+
+  // 上游没给 Retry-After 时退化成「等几十秒」，不能凭空编一个秒数。
+  const limitedNoHeader = Response.json({ code: 14003, msg: "too many requests" }, { status: 429 });
+  const noHeaderText = await __testing.workBuddyRequestOptions({ fetch: async () => limitedNoHeader })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.match(noHeaderText, /等几十秒/);
+  assert.doesNotMatch(noHeaderText, /约 \d+ 秒/);
+
+  // 只有 429 状态但没有已知业务码时也要走限流提示。
+  const bare429 = Response.json({ message: "rate limited" }, { status: 429 });
+  const bareText = await __testing.workBuddyRequestOptions({ fetch: async () => bare429 })
+    .fetch("https://copilot.tencent.com/v2/chat/completions", {}).then((r) => r.text());
+  assert.match(bareText, /请求过于频繁/);
+
+  /*
    * 11158 —— 账号类型无权使用该模型。上游原文实测为
    *   model [kimi-k3.1-pro-highspeed] is not allowed for user type [enterprise_user]
    * 同账号下 kimi-k3.1-pro / deepseek-v4.1-flash 都可用，所以这不是凭据或上下文问题。
