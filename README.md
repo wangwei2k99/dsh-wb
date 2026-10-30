@@ -57,6 +57,16 @@ node cli.js install
 ```
 
 这条命令会扫描 `~/.dsh/profiles` 下所有真实 Profile（含 `desktop`），逐个清理旧包并安装。
+用 `link:` 本地链接安装的 Profile 会自动跳过（那是开发/调试用的，不该被改成发布源）。
+
+> **关于 DSH 插件页的「更新」按钮**：它只对**官方按需插件**生效。
+> 宿主只在包出现在官方 catalog 里时才生成 `installTarget`，拿不到这个字段时点「更新」
+> 会直接静默返回、没有任何提示——本插件是第三方 GitHub 包，所以点了不会有反应。
+> 这是 DSH 的设计，不是插件故障。
+>
+> **正确的更新方式**是重跑 `node cli.js install`，或对单个 Profile 执行
+> `dsh plugin --profile desktop add github:wangwei2k99/dsh-wb`。
+> 两者都会拉取 GitHub 默认分支的最新提交，因此不依赖发布的版本号。
 
 仅安装 Web Profile：
 
@@ -226,6 +236,7 @@ DSH 自动压缩的做法是把「要被压缩的那段历史」原样回放给�
 | 问题 | 处理方法 |
 | --- | --- |
 | 找不到 WorkBuddy 提供方或设置入口 | 确认安装到正在使用的 Profile，完整重启 DSH 后再查看 |
+| 插件页点「更新」没反应 | 该按钮只对官方按需插件生效，第三方插件不生成 `installTarget`，点了会静默返回。属 DSH 设计。改用 `node cli.js install` 或 `dsh plugin --profile desktop add github:wangwei2k99/dsh-wb` |
 | 更新后仍是旧版本或旧界面 | 重新执行对应 Profile 的更新命令，完整退出并重新打开 DSH |
 | API Key 下拉列表没有新 Key | 在插件自己的"新增 API Key"区域提交，点击"添加并使用" |
 | 登录成功但调用使用了其他账号 | 检查是否启用了会话级凭据，并核对当前会话的绑定 |

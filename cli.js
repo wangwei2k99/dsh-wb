@@ -24,7 +24,17 @@ const PACKAGE = "@wangwei2k99/dsh-workbuddy";
 // 改名前的包名：安装/卸载时一并清理，避免两套并存。
 const LEGACY_PACKAGES = ["dsh-llm-workbuddy", "dsh-llm-codebuddy", "@axiaohungry/dsh-llm-workbuddy"];
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
-const PACKAGE_SPEC = `${PACKAGE}@${PACKAGE_VERSION}`;
+/*
+ * 安装源必须是 GitHub，不能是 `@scope/name@version`。
+ *
+ * 这个包**没有发布到 npm registry**（查询返回 404），所以 `@wangwei2k99/dsh-workbuddy@x.y.z`
+ * 这种 npm 版本号形式必然安装失败——以前 `node cli.js install` 就是死在这里。
+ * 桌面 Profile 里记录的也是 `github:` 源，这里保持与之一致。
+ *
+ * 用 GitHub 源还有个附带好处：`plugin add` 会拉取仓库默认分支的最新提交，
+ * 因此「重跑 install」天然就是「更新到最新版」，不依赖发布的版本号。
+ */
+const PACKAGE_SPEC = "github:wangwei2k99/dsh-wb";
 const PROVIDER_PATH = ["llm-pi-ai", "providers", "workbuddy-cn"];
 const LEGACY_PROVIDER_PATH = ["llm-pi-ai", "providers", "codebuddy-cn"];
 const IGNORED_BUILDS = ["@google/genai", "protobufjs"];
@@ -52,14 +62,51 @@ function dshEnv() {
   };
 }
 
+/**
+ * 定位 dsh 可执行文件。
+ *
+ * 不能只依赖 PATH：Windows 上 DSH 桌面版把 `dsh.cmd` 放在安装目录里，
+ * 默认不会加进 PATH，直接 spawn "dsh.cmd" 会报「不是内部或外部命令」，
+ * `node cli.js install` 因此直接失败。这里按 e2e 测试同样的顺序找绝对路径。
+ */
+function dshBin() {
+  const override = process.env.DSH_BIN;
+  if (override && existsSync(override)) return override;
+  if (process.platform !== "win32") return "dsh";
+  const candidates = [
+    join(process.env.LOCALAPPDATA ?? "", "Programs", "DeepSeek Harness", "resources", "runtime", "cli", "bin", "dsh.cmd"),
+    join(process.env.ProgramFiles ?? "", "DeepSeek Harness", "resources", "runtime", "cli", "bin", "dsh.cmd"),
+    join(process.env["ProgramFiles(x86)"] ?? "", "DeepSeek Harness", "resources", "runtime", "cli", "bin", "dsh.cmd"),
+  ];
+  return candidates.find((c) => existsSync(c)) ?? "dsh.cmd";
+}
+
 function runDsh(args) {
-  const result = spawnSync(process.platform === "win32" ? "dsh.cmd" : "dsh", args, {
+  const bin = dshBin();
+  /*
+   * Windows 下 `.cmd` 是批处理包装，必须走 shell 才能执行。
+   *
+   * 但 `shell: true` 配数组参数会触发 DEP0190（Node 只做字符串拼接、不转义，
+   * 有命令注入风险）。所以这里自己构造完整命令行并逐个加引号：既保留 shell
+   * 执行 .cmd 的能力，又不把未转义参数交给 cmd.exe 解析。
+   * 路径含空格（`Program Files`、`DeepSeek Harness`）时也必须加引号，
+   * 否则会被当成参数分隔符。
+   */
+  const quote = (value) => (/[\s"]/u.test(value) ? `"${value.replaceAll('"', '""')}"` : value);
+  const isWin = process.platform === "win32";
+  const commandLine = [bin, ...args].map(quote).join(" ");
+  const result = spawnSync(isWin ? commandLine : bin, isWin ? [] : args, {
     stdio: "inherit",
-    shell: process.platform === "win32",
+    shell: isWin,
     env: dshEnv(),
   });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`dsh ${args.join(" ")} 执行失败（退出码 ${result.status}）`);
+  if (result.status !== 0) {
+    throw new Error(
+      `dsh ${args.join(" ")} 执行失败（退出码 ${result.status}）`
+      + (bin === "dsh.cmd" ? "\n找不到 dsh 可执行文件。请设置 DSH_BIN，或确认 DSH 已安装。" : ""),
+    );
+  }
 }
 
 function entrySettingsVersion(output) {
@@ -70,12 +117,12 @@ function entrySettingsVersion(output) {
 }
 
 function usesEntrySettings() {
-  const result = spawnSync(process.platform === "win32" ? "dsh.cmd" : "dsh", ["--version"], {
+  const result = spawnSync(dshBin(), ["--version"], {
     encoding: "utf8",
     shell: process.platform === "win32",
     env: dshEnv(),
   });
-  if (result.error || result.status !== 0) throw new Error("无法检测 DSH 版本，请确认 dsh 命令可用");
+  if (result.error || result.status !== 0) throw new Error("无法检测 DSH 版本，请确认 dsh 命令可用（或设置 DSH_BIN）");
   const modern = entrySettingsVersion(result.stdout);
   if (modern === undefined) throw new Error("无法识别 DSH 版本，令牌已保存；请在模型设置中手动选择令牌登录");
   return modern;
@@ -225,8 +272,32 @@ function targetProfiles(home = dshHome()) {
   return found.length ? found : ["web", "headless"];
 }
 
+/**
+ * 该 profile 是否用本地目录链接安装本插件（`link:` 源）。
+ *
+ * `link:` 是开发/测试用的本地链接，指向某个源码目录。这类 profile 不该被
+ * `install` 改成 GitHub 源：一是会把正在调试的本地链接覆盖掉，二是链接目标
+ * 若是本仓库，pnpm 会因为 git-hosted 插件的 prepare 脚本策略直接失败，
+ * 连带让整条 `install` 中断——用户只想更新日常用的那个 profile，却被一个
+ * 测试 profile 卡住。
+ */
+function isLinkedInstall(home, profile) {
+  const file = join(home, "profiles", profile, "package.json");
+  if (!existsSync(file)) return false;
+  try {
+    const spec = JSON.parse(readFileSync(file, "utf8")).dependencies?.[PACKAGE];
+    return typeof spec === "string" && spec.startsWith("link:");
+  } catch {
+    return false;
+  }
+}
+
 function install() {
   for (const profile of targetProfiles()) {
+    if (isLinkedInstall(dshHome(), profile)) {
+      console.log(`跳过 ${profile}：该 profile 用 link: 本地链接安装，不属于发布态安装。`);
+      continue;
+    }
     runDsh(["plugin", "--profile", profile, "list", "--depth", "0"]);
     const workspace = join(dshHome(), "profiles", profile, "pnpm-workspace.yaml");
     withPnpmBuildPolicy(workspace, () => {
@@ -238,7 +309,14 @@ function install() {
       runDsh(["plugin", "--profile", profile, "add", PACKAGE_SPEC]);
     });
   }
-  console.log("WorkBuddy Provider 已安装。请重启 DSH 后进行配置。");
+  console.log(`WorkBuddy Provider 已安装（本仓库版本 ${PACKAGE_VERSION}）。请重启 DSH 后进行配置。`);
+  /*
+   * DSH 插件页的「更新」按钮只对官方按需插件生效：宿主只在包出现在官方 catalog 里时
+   * 才给出 installTarget，没有它时点更新会直接静默返回。第三方插件因此要显式说明
+   * 更新方式，否则用户会以为按钮坏了。
+   */
+  console.log("更新方式：重跑本命令即可（会拉取 GitHub 默认分支的最新提交）。");
+  console.log("DSH 插件页的「更新」按钮对第三方插件不生效，属宿主设计。");
 }
 
 function uninstall(home = dshHome()) {
@@ -330,6 +408,14 @@ function selfTest() {
     writeFileSync(join(profileHome, "profiles", "headless", "pnpm-workspace.yaml"), "packages:\n  - .\n", "utf8");
     if (targetProfiles(profileHome).join(",") !== "desktop,headless,web") {
       throw new Error(`profile scan self-test failed: ${targetProfiles(profileHome).join(",")}`);
+    }
+    /*
+     * 安装源必须是 github:，不能是 `@scope/name@version`。
+     * 这个包没发到 npm（registry 返回 404），用 npm 版本号形式会让 `node cli.js install`
+     * 必然失败。这条断言防止以后有人把它改回去。
+     */
+    if (!PACKAGE_SPEC.startsWith("github:") || PACKAGE_SPEC.includes("@", 1)) {
+      throw new Error(`install spec self-test failed: ${PACKAGE_SPEC}`);
     }
     console.log("CLI-SELF-TEST-OK");
   } finally {
